@@ -1,0 +1,5 @@
+/dist-newstyle/
+/.ghc.environment.*
+/cabal.project.local
+/cabal.project.local.*
+*.bak
