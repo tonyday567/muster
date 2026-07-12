@@ -112,10 +112,14 @@ data Cmd
   | CmdNames
   | CmdLog
   | CmdChannels
+  | CmdClean String Bool
   deriving (Show)
 
 nameArg :: Parser String
 nameArg = argument str (metavar "NAME" <> help "Participant name")
+
+channelArg :: Parser String
+channelArg = argument str (metavar "CHANNEL" <> help "Channel name under bus root")
 
 optionalNameArg :: Parser (Maybe String)
 optionalNameArg =
@@ -148,6 +152,14 @@ timeoutOpt =
           <> help "Give up after this many seconds (default: block until mail)"
       )
 
+yesOpt :: Parser Bool
+yesOpt =
+  switch
+    ( long "yes"
+        <> short 'y'
+        <> help "Skip confirmation prompt"
+    )
+
 cmdParser :: Parser Cmd
 cmdParser =
   hsubparser
@@ -170,6 +182,12 @@ cmdParser =
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
         <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
         <> command "channels" (info (pure CmdChannels) (progDesc "List all channels with metadata"))
+        <> command
+          "clean"
+          ( info
+              (CmdClean <$> channelArg <*> yesOpt)
+              (progDesc "Wipe a channel (bus must be stopped; confirms unless -y)")
+          )
     )
 
 busCmdParser :: Parser BusCmd
@@ -377,6 +395,71 @@ runNames opts = do
 runLog :: Global -> IO ()
 runLog opts = channelDir opts >>= MB.dumpLog
 
+-- | Wipe a channel: cursors, watches, log, fifo, pid. Bus must be down.
+--
+-- Confirms on stdin unless @--yes@. Does not remove the channel directory.
+runClean :: Global -> String -> Bool -> IO ()
+runClean opts channel yes = do
+  when (null channel || any isSpace channel || channel == "." || channel == "..") do
+    hPutStrLn stderr $ "muster: invalid channel '" <> channel <> "'"
+    exitWith (ExitFailure 1)
+  when ("_" `isPrefixOf` channel) do
+    hPutStrLn stderr $ "muster: refusing to clean reserved path '" <> channel <> "'"
+    exitWith (ExitFailure 1)
+  root <- busRoot opts
+  let dir = root </> channel
+  exists <- doesDirectoryExist dir
+  unless exists do
+    hPutStrLn stderr $ "muster: no channel directory " <> dir
+    exitWith (ExitFailure 1)
+  live <- MB.busLiveness dir
+  unless (live == "down") do
+    hPutStrLn stderr $
+      "muster: bus is "
+        <> live
+        <> " on "
+        <> channel
+        <> " — stop it first (muster -c "
+        <> channel
+        <> " bus stop)"
+    exitWith (ExitFailure 1)
+  nLines <- countLogLines dir
+  nParts <- length <$> cursorNames dir
+  unless yes do
+    putStr $
+      "Wipe channel "
+        <> channel
+        <> " ("
+        <> show nLines
+        <> " lines, "
+        <> show nParts
+        <> " participants)? [y/N] "
+    hFlush stdout
+    ans <- getLine
+    unless (ans == "y" || ans == "Y" || ans == "yes") do
+      putStrLn "aborted"
+      exitWith (ExitFailure 1)
+  entries <- listDirectory dir
+  let wipe =
+        [ e
+        | e <- entries
+        , ".cursor-" `isPrefixOf` e
+            || ".watch-" `isPrefixOf` e
+            || ".watch.pid-" `isPrefixOf` e
+            || e `elem` ["log.md", "err.md", "bus.pid", "bus.fifo"]
+        ]
+  mapM_ (\e -> removePathForcibly (dir </> e)) wipe
+  putStrLn $
+    "cleaned "
+      <> channel
+      <> " ("
+      <> show (length wipe)
+      <> " files removed; "
+      <> show nLines
+      <> " lines / "
+      <> show nParts
+      <> " participants gone)"
+
 -- | List every channel under the bus root that has a @log.md@.
 --
 -- Output (aligned columns):
@@ -466,3 +549,4 @@ main = do
     CmdNames -> runNames opts
     CmdLog -> runLog opts
     CmdChannels -> runChannels opts
+    CmdClean channel yes -> runClean opts channel yes
