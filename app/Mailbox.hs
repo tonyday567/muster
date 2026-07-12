@@ -39,7 +39,7 @@ import System.Directory
   )
 import System.Environment (getExecutablePath)
 import System.Exit (ExitCode (..), exitWith)
-import System.FilePath (takeBaseName, (</>))
+import System.FilePath (takeFileName, (</>))
 import System.IO
   ( BufferMode (..),
     Handle,
@@ -99,7 +99,10 @@ pathsFor dir =
 
 watchPidFile :: FilePath -> FilePath -> FilePath
 watchPidFile dir cursorfile =
-  let base = takeBaseName cursorfile
+  -- Use takeFileName (not takeBaseName): cursors are ".watch-NAME" / ".cursor-NAME"
+  -- and takeBaseName would strip ".NAME" as a fake extension, collapsing every
+  -- watcher onto one pidfile (".watch.pid-.watch") — multi-watcher death.
+  let base = takeFileName cursorfile
       -- Match bash: watchname="${cursorbase#.cursor-}"
       watchname = fromMaybe base (stripPrefix' ".cursor-" base)
    in dir </> ".watch.pid-" <> watchname
