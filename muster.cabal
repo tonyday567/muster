@@ -73,6 +73,7 @@ executable muster
     -- Other library packages from which modules are imported.
     build-depends:
         base,
+        cursor,
         optparse-applicative,
         text,
         directory,

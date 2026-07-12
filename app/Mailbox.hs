@@ -27,6 +27,7 @@ where
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad (forever, unless, void, when)
+import Cursor qualified as Cur
 import Data.Char (isSpace)
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
@@ -116,36 +117,17 @@ pidToInt :: ProcessID -> Int
 pidToInt (CPid x) = fromIntegral x
 
 -- ---------------------------------------------------------------------------
--- Line counting (match `wc -l`: count newline bytes)
+-- Log metrics (not cursor position — see the @cursor@ package for that)
 -- ---------------------------------------------------------------------------
 
+-- | Count newline bytes in a log (match @wc -l@). Used for bus status and
+-- post-grew checks; read/watch positions go through 'Cur.Cursor'.
 countNewlines :: FilePath -> IO Int
 countNewlines path = do
   exists <- doesFileExist path
   if not exists
     then pure 0
     else T.count "\n" <$> TIO.readFile path
-
-readCursor :: FilePath -> IO Int
-readCursor cursorfile = do
-  exists <- doesFileExist cursorfile
-  if not exists
-    then pure 0
-    else do
-      raw <- readFile cursorfile
-      pure $ fromMaybe 0 $ readMaybe (filter (not . isSpace) raw)
-
-writeCursor :: FilePath -> Int -> IO ()
-writeCursor cursorfile n = writeFile cursorfile (show n <> "\n")
-
--- | Message lines after the cursor.  Cursor stores a @wc -l@ count; with a
--- trailing newline on every framed post the listed-line count equals that.
-linesAfter :: FilePath -> Int -> IO [Text]
-linesAfter logPath cur = do
-  exists <- doesFileExist logPath
-  if not exists
-    then pure []
-    else drop cur . T.lines <$> TIO.readFile logPath
 
 -- ---------------------------------------------------------------------------
 -- Process liveness (kill -0)
@@ -383,17 +365,15 @@ readNew :: FilePath -> FilePath -> IO ()
 readNew dir cursorfile = do
   let p = pathsFor dir
   createDirectoryIfMissing True dir
-  exists <- doesFileExist cursorfile
-  unless exists $ writeFile cursorfile "0\n"
-  cur <- readCursor cursorfile
-  total <- countNewlines (mbLog p)
-  when (total > cur) do
-    ls <- linesAfter (mbLog p) cur
-    mapM_ TIO.putStrLn ls
-  writeCursor cursorfile total
+  c <- Cur.newFile cursorfile
+  ls <- Cur.pollFile c (mbLog p)
+  mapM_ TIO.putStrLn ls
 
 -- | Block until a non-excluded message appears. Exit 0 with printed lines,
 -- 2 on timeout, 3 if another watcher is already live for this cursor.
+--
+-- Read position is a file-backed 'Cur.Cursor' (same type Repl could use
+-- with 'Cur.newMem').
 wait ::
   FilePath ->
   FilePath ->
@@ -419,26 +399,22 @@ wait dir cursorfile timeoutSec exclude = do
   writeFile wpid (show (pidToInt self) <> "\n")
   let cleanup = void $ try @IOException $ removeFile wpid
   ( do
-      exists <- doesFileExist cursorfile
-      unless exists $ writeFile cursorfile "0\n"
-      cur0 <- readCursor cursorfile
-      go p cur0 0
+      c <- Cur.newFile cursorfile
+      go c p 0
     )
     `finally` cleanup
   where
-    go :: MailboxPaths -> Int -> Int -> IO ExitCode
-    go p cur elapsed = do
-      total <- countNewlines (mbLog p)
-      if total > cur
+    go :: Cur.Cursor -> MailboxPaths -> Int -> IO ExitCode
+    go c p elapsed = do
+      ls <- Cur.pollFile c (mbLog p)
+      if not (null ls)
         then do
-          ls <- linesAfter (mbLog p) cur
-          writeCursor cursorfile total
           let woke =
                 if null exclude
                   then ls
                   else filter (not . (T.pack exclude `T.isPrefixOf`)) ls
           if null woke
-            then go p total elapsed -- only own/filtered traffic
+            then go c p elapsed -- only own/filtered traffic; cursor already advanced
             else do
               mapM_ TIO.putStrLn woke
               hFlush stdout
@@ -450,7 +426,7 @@ wait dir cursorfile timeoutSec exclude = do
               pure (ExitFailure 2)
             else do
               threadDelay 1000000
-              go p cur (elapsed + 1)
+              go c p (elapsed + 1)
 
 dumpLog :: FilePath -> IO ()
 dumpLog dir = do

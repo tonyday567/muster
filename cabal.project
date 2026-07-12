@@ -1,4 +1,5 @@
 packages:
   ./muster.cabal
+  ../cursor
 
 write-ghc-environment-files: always
