@@ -6,22 +6,25 @@
 --
 -- An IRC-flavoured front-end to the shared append-only mailbox. Channels are
 -- isolated under @~/mg/logs/muster/<channel>@; the default channel is
--- @general@.
+-- @general@.  The engine is native Haskell ('Mailbox'); the bash
+-- @mailbox.sh@ remains available on disk for rollback but is no longer
+-- invoked from this binary.
 module Main (main) where
 
 import Control.Monad (unless, when)
 import Data.Char (isSpace)
 import Data.List (intercalate, isPrefixOf, sort)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Mailbox qualified as MB
 import Options.Applicative
 import System.Directory
-import System.Environment (getEnv, lookupEnv, setEnv, unsetEnv)
+import System.Environment (getEnv, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO
-import System.Process
 import Text.Read (readMaybe)
 import Prelude
 
@@ -62,7 +65,7 @@ globalParser =
 --
 -- Preference order:
 --   1. @--bus-root@ if non-empty
---   2. @MAILBOX_DIR@ env if non-empty
+--   2. @MAILBOX_DIR@ env if non-empty (treated as a single-channel dir root parent)
 --   3. @$HOME/mg/logs/muster@
 busRoot :: Global -> IO FilePath
 busRoot (Global _ root)
@@ -78,10 +81,6 @@ channelDir :: Global -> IO FilePath
 channelDir opts = do
   root <- busRoot opts
   pure (root </> globalChannel opts)
-
--- | Path to the hardened bash mailbox script.
-mailboxScript :: Global -> IO FilePath
-mailboxScript _ = (</> "mg/logs/board/mailbox.sh") <$> getEnv "HOME"
 
 -- | Cursor file for a participant inside a channel directory.
 cursorFile :: FilePath -> String -> FilePath
@@ -101,7 +100,7 @@ logFile dir = dir </> "log.md"
 -- Commands
 -- ---------------------------------------------------------------------------
 
-data BusCmd = BusStart | BusStop | BusStatus deriving (Show, Eq)
+data BusCmd = BusStart | BusStop | BusStatus | BusDaemon deriving (Show, Eq)
 
 data Cmd
   = CmdBus BusCmd
@@ -153,6 +152,7 @@ busCmdParser =
     ( command "start" (info (pure BusStart) (progDesc "Start the bus daemon"))
         <> command "stop" (info (pure BusStop) (progDesc "Stop the bus daemon"))
         <> command "status" (info (pure BusStatus) (progDesc "Report bus health"))
+        <> command "daemon" (info (pure BusDaemon) (progDesc "Internal: run the bus relay loop"))
     )
 
 data Options = Options Global Cmd
@@ -170,37 +170,15 @@ optionsParser =
 -- Execution
 -- ---------------------------------------------------------------------------
 
-withMailboxDir :: FilePath -> IO a -> IO a
-withMailboxDir dir io = do
-  old <- lookupEnv "MAILBOX_DIR"
-  setEnv "MAILBOX_DIR" dir
-  res <- io
-  case old of
-    Just v | not (null v) -> setEnv "MAILBOX_DIR" v
-    _ -> unsetEnv "MAILBOX_DIR"
-  pure res
-
-runMailbox' :: Global -> [String] -> IO (ExitCode, String, String)
-runMailbox' opts args = do
-  dir <- channelDir opts
-  script <- mailboxScript opts
-  createDirectoryIfMissing True dir
-  withMailboxDir dir $ readProcessWithExitCode script args ""
-
-runMailbox :: Global -> [String] -> IO ()
-runMailbox opts args = do
-  (exit, out, err) <- runMailbox' opts args
-  unless (null out) $ putStr out
-  unless (null err) $ hPutStr stderr err
-  case exit of
-    ExitSuccess -> pure ()
-    e -> exitWith e
-
 runBus :: Global -> BusCmd -> IO ()
 runBus opts = \case
-  BusStart -> runMailbox opts ["start"]
-  BusStop -> runMailbox opts ["stop"]
-  BusStatus -> runMailbox opts ["status"]
+  BusStart -> do
+    dir <- channelDir opts
+    root <- busRoot opts
+    MB.busStart dir (globalChannel opts) root
+  BusStop -> channelDir opts >>= MB.busStop
+  BusStatus -> channelDir opts >>= MB.busStatus
+  BusDaemon -> channelDir opts >>= MB.busDaemon
 
 runJoin :: Global -> String -> IO ()
 runJoin opts name = do
@@ -230,7 +208,8 @@ runPost opts name msg = do
   when (T.null msg) do
     hPutStrLn stderr "muster: empty message"
     exitWith (ExitFailure 1)
-  runMailbox opts ["post", name, T.unpack msg]
+  dir <- channelDir opts
+  MB.post dir name msg
 
 requireCursor :: Global -> String -> IO FilePath
 requireCursor opts name = do
@@ -245,7 +224,8 @@ requireCursor opts name = do
 runRead :: Global -> String -> IO ()
 runRead opts name = do
   cursor <- requireCursor opts name
-  runMailbox opts ["read", cursor]
+  dir <- channelDir opts
+  MB.readNew dir cursor
 
 -- | Resolve an explicit watch name, or default to the sole cursor in the
 -- channel.  Errors if there are zero or many cursors.
@@ -288,11 +268,9 @@ runWatch opts mname mto = do
   let wc = watchCursorFile dir name
   exists <- doesFileExist wc
   unless exists $ initWatchCursor dir joinCursor wc
-  let timeout = maybe "86400" show mto
+  let timeout = fromMaybe 86400 mto
   let loop = do
-        (exit, out, err) <- runMailbox' opts ["wait", wc, timeout, "[" <> name <> "] "]
-        unless (null out) $ putStr out >> hFlush stdout
-        unless (null err) $ hPutStr stderr err >> hFlush stderr
+        exit <- MB.wait dir wc timeout ("[" <> name <> "] ")
         case exit of
           ExitSuccess -> loop
           ExitFailure 2 -> pure () -- timeout expired
@@ -313,13 +291,7 @@ runNames opts = do
         else mapM_ putStrLn cursors
 
 runLog :: Global -> IO ()
-runLog opts = do
-  dir <- channelDir opts
-  let path = logFile dir
-  exists <- doesFileExist path
-  if exists
-    then TIO.readFile path >>= TIO.putStr
-    else pure ()
+runLog opts = channelDir opts >>= MB.dumpLog
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -331,9 +303,7 @@ countLogLines dir = do
   exists <- doesFileExist logPath
   if not exists
     then pure 0
-    else do
-      content <- TIO.readFile logPath
-      pure $ length $ filter (not . T.null) $ T.splitOn "\n" content
+    else T.count "\n" <$> TIO.readFile logPath
 
 validateName :: String -> IO ()
 validateName name
