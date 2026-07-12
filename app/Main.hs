@@ -11,7 +11,7 @@ module Main (main) where
 
 import Control.Monad (unless, when)
 import Data.Char (isSpace)
-import Data.List (isPrefixOf, sort)
+import Data.List (intercalate, isPrefixOf, sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -22,6 +22,7 @@ import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO
 import System.Process
+import Text.Read (readMaybe)
 import Prelude
 
 -- ---------------------------------------------------------------------------
@@ -86,6 +87,12 @@ mailboxScript _ = (</> "mg/logs/board/mailbox.sh") <$> getEnv "HOME"
 cursorFile :: FilePath -> String -> FilePath
 cursorFile dir name = dir </> ".cursor-" <> name
 
+-- | Dedicated watch cursor for a participant.  Separating this from the join
+-- cursor lets an agent read and watch concurrently, and lets N agents block on
+-- the same channel without contending on a single cursor.
+watchCursorFile :: FilePath -> String -> FilePath
+watchCursorFile dir name = dir </> ".watch-" <> name
+
 -- | Log file path inside a channel directory.
 logFile :: FilePath -> FilePath
 logFile dir = dir </> "log.md"
@@ -102,13 +109,16 @@ data Cmd
   | CmdLeave String
   | CmdPost String Text
   | CmdRead String
-  | CmdWatch String (Maybe Int)
+  | CmdWatch (Maybe String) (Maybe Int)
   | CmdNames
   | CmdLog
   deriving (Show)
 
 nameArg :: Parser String
 nameArg = argument str (metavar "NAME" <> help "Participant name")
+
+optionalNameArg :: Parser (Maybe String)
+optionalNameArg = optional $ argument str (metavar "NAME" <> help "Participant name (default: sole cursor)")
 
 msgArgs :: Parser Text
 msgArgs = fmap T.unwords $ some $ argument str (metavar "MESSAGE" <> help "Message body")
@@ -132,7 +142,7 @@ cmdParser =
         <> command "leave" (info (CmdLeave <$> nameArg) (progDesc "Leave the muster"))
         <> command "post" (info (CmdPost <$> nameArg <*> msgArgs) (progDesc "Post a message"))
         <> command "read" (info (CmdRead <$> nameArg) (progDesc "Read new messages"))
-        <> command "watch" (info (CmdWatch <$> nameArg <*> timeoutOpt) (progDesc "Block until someone posts"))
+        <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt) (progDesc "Block until someone posts"))
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
         <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
     )
@@ -170,18 +180,21 @@ withMailboxDir dir io = do
     _ -> unsetEnv "MAILBOX_DIR"
   pure res
 
-runMailbox :: Global -> [String] -> IO ()
-runMailbox opts args = do
+runMailbox' :: Global -> [String] -> IO (ExitCode, String, String)
+runMailbox' opts args = do
   dir <- channelDir opts
   script <- mailboxScript opts
   createDirectoryIfMissing True dir
-  withMailboxDir dir do
-    (exit, out, err) <- readProcessWithExitCode script args ""
-    unless (null out) $ putStr out
-    unless (null err) $ hPutStr stderr err
-    case exit of
-      ExitSuccess -> pure ()
-      e -> exitWith e
+  withMailboxDir dir $ readProcessWithExitCode script args ""
+
+runMailbox :: Global -> [String] -> IO ()
+runMailbox opts args = do
+  (exit, out, err) <- runMailbox' opts args
+  unless (null out) $ putStr out
+  unless (null err) $ hPutStr stderr err
+  case exit of
+    ExitSuccess -> pure ()
+    e -> exitWith e
 
 runBus :: Global -> BusCmd -> IO ()
 runBus opts = \case
@@ -234,11 +247,57 @@ runRead opts name = do
   cursor <- requireCursor opts name
   runMailbox opts ["read", cursor]
 
-runWatch :: Global -> String -> Maybe Int -> IO ()
-runWatch opts name mto = do
-  cursor <- requireCursor opts name
-  let timeout = maybe "3600" show mto
-  runMailbox opts ["wait", cursor, timeout, "[" <> name <> "] "]
+-- | Resolve an explicit watch name, or default to the sole cursor in the
+-- channel.  Errors if there are zero or many cursors.
+resolveName :: Global -> Maybe String -> IO String
+resolveName _ (Just name) = pure name
+resolveName opts Nothing = do
+  dir <- channelDir opts
+  exists <- doesDirectoryExist dir
+  entries <- if exists then listDirectory dir else pure []
+  let names = sort [drop 8 e | e <- entries, ".cursor-" `isPrefixOf` e]
+  case names of
+    [name] -> pure name
+    [] -> do
+      hPutStrLn stderr $ "muster: no participants in " <> globalChannel opts
+      exitWith (ExitFailure 1)
+    _ -> do
+      hPutStrLn stderr $
+        "muster: ambiguous name; candidates: " <> intercalate ", " names
+      exitWith (ExitFailure 1)
+
+-- | Initialise a watch cursor from the participant's join cursor, or from the
+-- current log length if no join cursor exists.
+initWatchCursor :: FilePath -> FilePath -> FilePath -> IO ()
+initWatchCursor dir joinCursor watchCursor = do
+  n <-
+    doesFileExist joinCursor >>= \case
+      True -> do
+        txt <- readFile joinCursor
+        case readMaybe (filter (not . isSpace) txt) of
+          Just i -> pure i
+          Nothing -> countLogLines dir
+      False -> countLogLines dir
+  writeFile watchCursor (show n <> "\n")
+
+runWatch :: Global -> Maybe String -> Maybe Int -> IO ()
+runWatch opts mname mto = do
+  name <- resolveName opts mname
+  dir <- channelDir opts
+  joinCursor <- requireCursor opts name
+  let wc = watchCursorFile dir name
+  exists <- doesFileExist wc
+  unless exists $ initWatchCursor dir joinCursor wc
+  let timeout = maybe "86400" show mto
+  let loop = do
+        (exit, out, err) <- runMailbox' opts ["wait", wc, timeout, "[" <> name <> "] "]
+        unless (null out) $ putStr out >> hFlush stdout
+        unless (null err) $ hPutStr stderr err >> hFlush stderr
+        case exit of
+          ExitSuccess -> loop
+          ExitFailure 2 -> pure () -- timeout expired
+          e -> exitWith e
+  loop
 
 runNames :: Global -> IO ()
 runNames opts = do
@@ -296,6 +355,6 @@ main = do
     CmdLeave name -> runLeave opts name
     CmdPost name msg -> runPost opts name msg
     CmdRead name -> runRead opts name
-    CmdWatch name mto -> runWatch opts name mto
+    CmdWatch mname mto -> runWatch opts mname mto
     CmdNames -> runNames opts
     CmdLog -> runLog opts
