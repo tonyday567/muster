@@ -2,10 +2,11 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | muster — ad-hoc multiplicity events over the bus.
+-- | muster — ad-hoc multiplicity events over named bus channels.
 --
--- An IRC-flavoured front-end to the shared append-only mailbox.
--- Every command is visible in `--help`; no onboarding doc required.
+-- An IRC-flavoured front-end to the shared append-only mailbox. Channels are
+-- isolated under @~/mg/logs/muster/<channel>@; the default channel is
+-- @general@.
 module Main (main) where
 
 import Control.Monad (unless, when)
@@ -16,7 +17,7 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Options.Applicative
 import System.Directory
-import System.Environment (getEnv, lookupEnv)
+import System.Environment (getEnv, lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO
@@ -24,33 +25,73 @@ import System.Process
 import Prelude
 
 -- ---------------------------------------------------------------------------
+-- Global options
+-- ---------------------------------------------------------------------------
+
+data Global = Global
+  { globalChannel :: String,
+    globalBusRoot :: FilePath
+  }
+  deriving (Show)
+
+globalParser :: Parser Global
+globalParser =
+  Global
+    <$> strOption
+      ( long "channel"
+          <> short 'c'
+          <> value "general"
+          <> showDefault
+          <> metavar "CHANNEL"
+          <> help "Muster channel"
+      )
+    <*> strOption
+      ( long "bus-root"
+          <> value ""
+          <> showDefault
+          <> metavar "DIR"
+          <> help "Root directory for all bus state (default: $HOME/mg/logs/muster)"
+      )
+
+-- ---------------------------------------------------------------------------
 -- Bus layout
 -- ---------------------------------------------------------------------------
 
--- | Determine the bus directory.
+-- | Determine the root directory for all muster channels.
 --
--- Environment @MAILBOX_DIR@ overrides the default @$HOME/mg/logs/board@.
-busDir :: IO FilePath
-busDir = do
+-- Preference order:
+--   1. @--bus-root@ if non-empty
+--   2. @MAILBOX_DIR@ env if non-empty
+--   3. @$HOME/mg/logs/muster@
+busRoot :: Global -> IO FilePath
+busRoot (Global _ root)
+  | not (null root) = pure root
+busRoot _ = do
   menv <- lookupEnv "MAILBOX_DIR"
   case menv of
-    Just d -> pure d
-    Nothing -> (</> "mg/logs/board") <$> getEnv "HOME"
+    Just d | not (null d) -> pure d
+    _ -> (</> "mg/logs/muster") <$> getEnv "HOME"
+
+-- | Directory for a specific channel.
+channelDir :: Global -> IO FilePath
+channelDir opts = do
+  root <- busRoot opts
+  pure (root </> globalChannel opts)
 
 -- | Path to the hardened bash mailbox script.
-mailboxScript :: IO FilePath
-mailboxScript = (</> "mailbox.sh") <$> busDir
+mailboxScript :: Global -> IO FilePath
+mailboxScript _ = (</> "mg/logs/board/mailbox.sh") <$> getEnv "HOME"
 
--- | Cursor file for a participant.
+-- | Cursor file for a participant inside a channel directory.
 cursorFile :: FilePath -> String -> FilePath
 cursorFile dir name = dir </> ".cursor-" <> name
 
--- | Log file path.
+-- | Log file path inside a channel directory.
 logFile :: FilePath -> FilePath
 logFile dir = dir </> "log.md"
 
 -- ---------------------------------------------------------------------------
--- CLI shape
+-- Commands
 -- ---------------------------------------------------------------------------
 
 data BusCmd = BusStart | BusStop | BusStatus deriving (Show, Eq)
@@ -63,80 +104,55 @@ data Cmd
   | CmdRead String
   | CmdWatch String (Maybe Int)
   | CmdNames
-  deriving (Show, Eq)
+  | CmdLog
+  deriving (Show)
 
-cmdP :: Parser Cmd
-cmdP =
-  subparser
-    ( command
-        "bus"
-        ( info
-            (CmdBus <$> busCmdP <**> helper)
-            (progDesc "Lifecycle of the shared bus daemon")
-        )
-        <> command
-          "join"
-          ( info
-              (CmdJoin <$> argument str (metavar "NAME" <> help "Participant name"))
-              (progDesc "Join the muster (create a read cursor)")
-          )
-        <> command
-          "leave"
-          ( info
-              (CmdLeave <$> argument str (metavar "NAME" <> help "Participant name"))
-              (progDesc "Leave the muster (remove read cursor)")
-          )
-        <> command
-          "post"
-          ( info
-              ( CmdPost
-                  <$> argument str (metavar "NAME" <> help "Who is posting")
-                  <*> fmap T.pack (argument str (metavar "MESSAGE" <> help "Message body"))
-              )
-              (progDesc "Post a [named] message to the bus")
-          )
-        <> command
-          "read"
-          ( info
-              (CmdRead <$> argument str (metavar "NAME" <> help "Participant name"))
-              (progDesc "Read new messages since your last read")
-          )
-        <> command
-          "watch"
-          ( info
-              ( CmdWatch
-                  <$> argument str (metavar "NAME" <> help "Participant name")
-                  <*> optional
-                    ( option
-                        auto
-                        ( long "timeout"
-                            <> short 't'
-                            <> metavar "SECONDS"
-                            <> help "Give up after this many seconds (default: block until mail)"
-                        )
-                    )
-              )
-              (progDesc "Block until someone else posts, then print it")
-          )
-        <> command
-          "names"
-          (info (pure CmdNames) (progDesc "List participants with cursors"))
+nameArg :: Parser String
+nameArg = argument str (metavar "NAME" <> help "Participant name")
+
+msgArgs :: Parser Text
+msgArgs = fmap T.unwords $ some $ argument str (metavar "MESSAGE" <> help "Message body")
+
+timeoutOpt :: Parser (Maybe Int)
+timeoutOpt =
+  optional
+    $ option
+      auto
+      ( long "timeout"
+          <> short 't'
+          <> metavar "SECONDS"
+          <> help "Give up after this many seconds (default: block until mail)"
+      )
+
+cmdParser :: Parser Cmd
+cmdParser =
+  hsubparser
+    ( command "bus" (info (CmdBus <$> busCmdParser) (progDesc "Bus daemon lifecycle"))
+        <> command "join" (info (CmdJoin <$> nameArg) (progDesc "Join the muster"))
+        <> command "leave" (info (CmdLeave <$> nameArg) (progDesc "Leave the muster"))
+        <> command "post" (info (CmdPost <$> nameArg <*> msgArgs) (progDesc "Post a message"))
+        <> command "read" (info (CmdRead <$> nameArg) (progDesc "Read new messages"))
+        <> command "watch" (info (CmdWatch <$> nameArg <*> timeoutOpt) (progDesc "Block until someone posts"))
+        <> command "names" (info (pure CmdNames) (progDesc "List participants"))
+        <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
     )
 
-busCmdP :: Parser BusCmd
-busCmdP =
-  subparser
+busCmdParser :: Parser BusCmd
+busCmdParser =
+  hsubparser
     ( command "start" (info (pure BusStart) (progDesc "Start the bus daemon"))
         <> command "stop" (info (pure BusStop) (progDesc "Stop the bus daemon"))
         <> command "status" (info (pure BusStatus) (progDesc "Report bus health"))
     )
 
-opts :: ParserInfo Cmd
-opts =
+data Options = Options Global Cmd
+
+optionsParser :: ParserInfo Options
+optionsParser =
   info
-    (cmdP <**> helper)
+    (Options <$> globalParser <*> cmdParser <**> helper)
     ( fullDesc
-        <> progDesc "muster: an IRC-shaped shell for the coordination bus"
+        <> progDesc "muster: IRC-shaped shells for named coordination channels"
         <> header "muster — join, post, read, watch"
     )
 
@@ -144,101 +160,107 @@ opts =
 -- Execution
 -- ---------------------------------------------------------------------------
 
-main :: IO ()
-main = do
-  cmd <- execParser opts
-  case cmd of
-    CmdBus bc -> runBus bc
-    CmdJoin name -> runJoin name
-    CmdLeave name -> runLeave name
-    CmdPost name msg -> runPost name msg
-    CmdRead name -> runRead name
-    CmdWatch name mto -> runWatch name mto
-    CmdNames -> runNames
+withMailboxDir :: FilePath -> IO a -> IO a
+withMailboxDir dir io = do
+  old <- lookupEnv "MAILBOX_DIR"
+  setEnv "MAILBOX_DIR" dir
+  res <- io
+  case old of
+    Just v | not (null v) -> setEnv "MAILBOX_DIR" v
+    _ -> unsetEnv "MAILBOX_DIR"
+  pure res
 
--- | Run the mailbox script with the given arguments.
-runMailbox :: [String] -> IO ()
-runMailbox args = do
-  script <- mailboxScript
-  (exit, out, err) <- readProcessWithExitCode script args ""
-  unless (null out) $ putStr out
-  unless (null err) $ hPutStr stderr err
-  case exit of
-    ExitSuccess -> pure ()
-    e -> exitWith e
+runMailbox :: Global -> [String] -> IO ()
+runMailbox opts args = do
+  dir <- channelDir opts
+  script <- mailboxScript opts
+  createDirectoryIfMissing True dir
+  withMailboxDir dir do
+    (exit, out, err) <- readProcessWithExitCode script args ""
+    unless (null out) $ putStr out
+    unless (null err) $ hPutStr stderr err
+    case exit of
+      ExitSuccess -> pure ()
+      e -> exitWith e
 
-runBus :: BusCmd -> IO ()
-runBus = \case
-  BusStart -> runMailbox ["start"]
-  BusStop -> runMailbox ["stop"]
-  BusStatus -> runMailbox ["status"]
+runBus :: Global -> BusCmd -> IO ()
+runBus opts = \case
+  BusStart -> runMailbox opts ["start"]
+  BusStop -> runMailbox opts ["stop"]
+  BusStatus -> runMailbox opts ["status"]
 
-runJoin :: String -> IO ()
-runJoin name = do
-  dir <- busDir
+runJoin :: Global -> String -> IO ()
+runJoin opts name = do
+  dir <- channelDir opts
   createDirectoryIfMissing True dir
   let cursor = cursorFile dir name
   exists <- doesFileExist cursor
   if exists
-    then putStrLn $ "[" <> name <> "] already joined"
+    then putStrLn $ "[" <> name <> "] already joined in " <> globalChannel opts
     else do
-      -- Start cursor at the current end of the log so the participant
-      -- only sees mail that arrives after they join.
       total <- countLogLines dir
       writeFile cursor (show total <> "\n")
-      putStrLn $ "[" <> name <> "] joined; cursor at line " <> show total
+      putStrLn $ "[" <> name <> "] joined " <> globalChannel opts <> "; cursor at line " <> show total
 
-runLeave :: String -> IO ()
-runLeave name = do
-  dir <- busDir
+runLeave :: Global -> String -> IO ()
+runLeave opts name = do
+  dir <- channelDir opts
   let cursor = cursorFile dir name
   exists <- doesFileExist cursor
   if exists
-    then removeFile cursor >> putStrLn ("[" <> name <> "] left")
-    else putStrLn $ "[" <> name <> "] was not joined"
+    then removeFile cursor >> putStrLn ("[" <> name <> "] left " <> globalChannel opts)
+    else putStrLn $ "[" <> name <> "] was not joined in " <> globalChannel opts
 
-runPost :: String -> Text -> IO ()
-runPost name msg = do
+runPost :: Global -> String -> Text -> IO ()
+runPost opts name msg = do
   validateName name
   when (T.null msg) do
     hPutStrLn stderr "muster: empty message"
     exitWith (ExitFailure 1)
-  runMailbox ["post", name, T.unpack msg]
+  runMailbox opts ["post", name, T.unpack msg]
 
-runRead :: String -> IO ()
-runRead name = do
-  dir <- busDir
+requireCursor :: Global -> String -> IO FilePath
+requireCursor opts name = do
+  dir <- channelDir opts
   let cursor = cursorFile dir name
   exists <- doesFileExist cursor
   unless exists do
-    hPutStrLn stderr $ "muster: " <> name <> " has not joined (muster join " <> name <> ")"
+    hPutStrLn stderr $ "muster: " <> name <> " has not joined " <> globalChannel opts
     exitWith (ExitFailure 1)
-  runMailbox ["read", cursor]
+  pure cursor
 
-runWatch :: String -> Maybe Int -> IO ()
-runWatch name mto = do
-  dir <- busDir
-  let cursor = cursorFile dir name
-  exists <- doesFileExist cursor
-  unless exists do
-    hPutStrLn stderr $ "muster: " <> name <> " has not joined (muster join " <> name <> ")"
-    exitWith (ExitFailure 1)
+runRead :: Global -> String -> IO ()
+runRead opts name = do
+  cursor <- requireCursor opts name
+  runMailbox opts ["read", cursor]
+
+runWatch :: Global -> String -> Maybe Int -> IO ()
+runWatch opts name mto = do
+  cursor <- requireCursor opts name
   let timeout = maybe "3600" show mto
-  -- exclude own posts to avoid self-wake loops
-  runMailbox ["wait", cursor, timeout, "[" <> name <> "] "]
+  runMailbox opts ["wait", cursor, timeout, "[" <> name <> "] "]
 
-runNames :: IO ()
-runNames = do
-  dir <- busDir
+runNames :: Global -> IO ()
+runNames opts = do
+  dir <- channelDir opts
   exists <- doesDirectoryExist dir
   if not exists
-    then putStrLn "no bus directory"
+    then putStrLn $ "no bus directory for " <> globalChannel opts
     else do
       entries <- listDirectory dir
       let cursors = sort [drop 8 e | e <- entries, ".cursor-" `isPrefixOf` e]
       if null cursors
-        then putStrLn "no participants"
+        then putStrLn $ "no participants in " <> globalChannel opts
         else mapM_ putStrLn cursors
+
+runLog :: Global -> IO ()
+runLog opts = do
+  dir <- channelDir opts
+  let path = logFile dir
+  exists <- doesFileExist path
+  if exists
+    then TIO.readFile path >>= TIO.putStr
+    else pure ()
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -252,7 +274,6 @@ countLogLines dir = do
     then pure 0
     else do
       content <- TIO.readFile logPath
-      -- same rule as the bash bus: trailing newline means drop final empty part
       pure $ length $ filter (not . T.null) $ T.splitOn "\n" content
 
 validateName :: String -> IO ()
@@ -265,3 +286,16 @@ validateName name
     bad msg = do
       hPutStrLn stderr $ "muster: invalid name '" <> name <> "': " <> msg
       exitWith (ExitFailure 1)
+
+main :: IO ()
+main = do
+  Options opts cmd <- execParser optionsParser
+  case cmd of
+    CmdBus bc -> runBus opts bc
+    CmdJoin name -> runJoin opts name
+    CmdLeave name -> runLeave opts name
+    CmdPost name msg -> runPost opts name msg
+    CmdRead name -> runRead opts name
+    CmdWatch name mto -> runWatch opts name mto
+    CmdNames -> runNames opts
+    CmdLog -> runLog opts
