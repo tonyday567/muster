@@ -111,6 +111,7 @@ data Cmd
   | CmdWatch (Maybe String) (Maybe Int)
   | CmdNames
   | CmdLog
+  | CmdChannels
   deriving (Show)
 
 nameArg :: Parser String
@@ -144,6 +145,7 @@ cmdParser =
         <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt) (progDesc "Block until someone posts"))
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
         <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
+        <> command "channels" (info (pure CmdChannels) (progDesc "List all channels with metadata"))
     )
 
 busCmdParser :: Parser BusCmd
@@ -293,6 +295,59 @@ runNames opts = do
 runLog :: Global -> IO ()
 runLog opts = channelDir opts >>= MB.dumpLog
 
+-- | List every channel under the bus root that has a @log.md@.
+--
+-- Output (aligned columns):
+--
+-- > general      152 lines  6 participants  alive (pid 12044)
+-- > engine-test    3 lines  2 participants  down
+runChannels :: Global -> IO ()
+runChannels opts = do
+  root <- busRoot opts
+  exists <- doesDirectoryExist root
+  unless exists do
+    hPutStrLn stderr $ "muster: no bus root at " <> root
+    exitWith (ExitFailure 1)
+  entries <- listDirectory root
+  let candidates = sort entries
+  rows <- concat <$> mapM (channelRow root) candidates
+  case rows of
+    [] -> putStrLn $ "no channels under " <> root
+    _ -> do
+      let w = maximum (map (\(n, _, _, _) -> length n) rows)
+      mapM_ (putStrLn . formatRow w) rows
+  where
+    channelRow :: FilePath -> FilePath -> IO [(String, Int, Int, String)]
+    channelRow root name = do
+      let dir = root </> name
+      isDir <- doesDirectoryExist dir
+      hasLog <- doesFileExist (logFile dir)
+      if isDir && hasLog
+        then do
+          nLines <- countLogLines dir
+          nParts <- countParticipants dir
+          live <- MB.busLiveness dir
+          pure [(name, nLines, nParts, live)]
+        else pure []
+
+    countParticipants :: FilePath -> IO Int
+    countParticipants dir = do
+      es <- listDirectory dir
+      pure $ length [e | e <- es, ".cursor-" `isPrefixOf` e]
+
+    formatRow :: Int -> (String, Int, Int, String) -> String
+    formatRow w (name, nLines, nParts, live) =
+      padR w name
+        <> "  "
+        <> show nLines
+        <> " lines  "
+        <> show nParts
+        <> " participants  "
+        <> live
+
+    padR :: Int -> String -> String
+    padR n s = s <> replicate (max 0 (n - length s)) ' '
+
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
@@ -328,3 +383,4 @@ main = do
     CmdWatch mname mto -> runWatch opts mname mto
     CmdNames -> runNames opts
     CmdLog -> runLog opts
+    CmdChannels -> runChannels opts

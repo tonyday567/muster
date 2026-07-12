@@ -15,6 +15,7 @@ module Mailbox
     busStart,
     busStop,
     busStatus,
+    busLiveness,
     busDaemon,
     post,
     readNew,
@@ -329,6 +330,14 @@ busStatus dir = do
           <> "; no healthy bus on "
           <> mbFifo p
           <> ")"
+
+-- | Compact liveness for channel listings: @"alive (pid N)"@ or @"down"@.
+busLiveness :: FilePath -> IO String
+busLiveness dir = do
+  running <- busRunning (pathsFor dir)
+  pure $ case running of
+    Just pid -> "alive (pid " <> show (pidToInt pid) <> ")"
+    Nothing -> "down"
 
 -- ---------------------------------------------------------------------------
 -- Post / read / wait / log
