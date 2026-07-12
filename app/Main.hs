@@ -106,8 +106,8 @@ data Cmd
   = CmdBus BusCmd
   | CmdJoin String
   | CmdLeave String
-  | CmdPost String Text
-  | CmdRead String
+  | CmdPost [String]
+  | CmdRead (Maybe String)
   | CmdWatch (Maybe String) (Maybe Int)
   | CmdNames
   | CmdLog
@@ -118,10 +118,24 @@ nameArg :: Parser String
 nameArg = argument str (metavar "NAME" <> help "Participant name")
 
 optionalNameArg :: Parser (Maybe String)
-optionalNameArg = optional $ argument str (metavar "NAME" <> help "Participant name (default: sole cursor)")
+optionalNameArg =
+  optional $
+    argument
+      str
+      ( metavar "NAME"
+          <> help "Participant name (default: MUSTER_NAME, else sole cursor)"
+      )
 
-msgArgs :: Parser Text
-msgArgs = fmap T.unwords $ some $ argument str (metavar "MESSAGE" <> help "Message body")
+-- | Positional args for post: optional NAME then MESSAGE words, or MESSAGE alone
+-- when identity is resolvable (see 'resolvePostArgs').
+postArgs :: Parser [String]
+postArgs =
+  some $
+    argument
+      str
+      ( metavar "ARGS"
+          <> help "Optional NAME then MESSAGE, or MESSAGE with MUSTER_NAME/sole cursor"
+      )
 
 timeoutOpt :: Parser (Maybe Int)
 timeoutOpt =
@@ -140,8 +154,18 @@ cmdParser =
     ( command "bus" (info (CmdBus <$> busCmdParser) (progDesc "Bus daemon lifecycle"))
         <> command "join" (info (CmdJoin <$> nameArg) (progDesc "Join the muster"))
         <> command "leave" (info (CmdLeave <$> nameArg) (progDesc "Leave the muster"))
-        <> command "post" (info (CmdPost <$> nameArg <*> msgArgs) (progDesc "Post a message"))
-        <> command "read" (info (CmdRead <$> nameArg) (progDesc "Read new messages"))
+        <> command
+          "post"
+          ( info
+              (CmdPost <$> postArgs)
+              (progDesc "Post a message (NAME optional if MUSTER_NAME or sole cursor)")
+          )
+        <> command
+          "read"
+          ( info
+              (CmdRead <$> optionalNameArg)
+              (progDesc "Read new messages (NAME optional if MUSTER_NAME or sole cursor)")
+          )
         <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt) (progDesc "Block until someone posts"))
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
         <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
@@ -204,8 +228,9 @@ runLeave opts name = do
     then removeFile cursor >> putStrLn ("[" <> name <> "] left " <> globalChannel opts)
     else putStrLn $ "[" <> name <> "] was not joined in " <> globalChannel opts
 
-runPost :: Global -> String -> Text -> IO ()
-runPost opts name msg = do
+runPost :: Global -> [String] -> IO ()
+runPost opts args = do
+  (name, msg) <- resolvePostArgs opts args
   validateName name
   when (T.null msg) do
     hPutStrLn stderr "muster: empty message"
@@ -223,30 +248,87 @@ requireCursor opts name = do
     exitWith (ExitFailure 1)
   pure cursor
 
-runRead :: Global -> String -> IO ()
-runRead opts name = do
+runRead :: Global -> Maybe String -> IO ()
+runRead opts mname = do
+  name <- resolveName opts mname
   cursor <- requireCursor opts name
   dir <- channelDir opts
   MB.readNew dir cursor
 
--- | Resolve an explicit watch name, or default to the sole cursor in the
--- channel.  Errors if there are zero or many cursors.
+-- | Cursor participant names in a channel directory (sorted).
+cursorNames :: FilePath -> IO [String]
+cursorNames dir = do
+  exists <- doesDirectoryExist dir
+  entries <- if exists then listDirectory dir else pure []
+  pure $ sort [drop 8 e | e <- entries, ".cursor-" `isPrefixOf` e]
+
+-- | Resolve participant identity.
+--
+-- Preference:
+--   1. explicit @NAME@ argument
+--   2. @MUSTER_NAME@ environment variable
+--   3. sole @.cursor-*@ in the channel
+--
+-- Errors if zero or many cursors and no explicit/env identity.
 resolveName :: Global -> Maybe String -> IO String
 resolveName _ (Just name) = pure name
 resolveName opts Nothing = do
-  dir <- channelDir opts
-  exists <- doesDirectoryExist dir
-  entries <- if exists then listDirectory dir else pure []
-  let names = sort [drop 8 e | e <- entries, ".cursor-" `isPrefixOf` e]
-  case names of
-    [name] -> pure name
-    [] -> do
-      hPutStrLn stderr $ "muster: no participants in " <> globalChannel opts
-      exitWith (ExitFailure 1)
+  menv <- lookupEnv "MUSTER_NAME"
+  case menv of
+    Just n | not (null n) -> pure n
     _ -> do
-      hPutStrLn stderr $
-        "muster: ambiguous name; candidates: " <> intercalate ", " names
-      exitWith (ExitFailure 1)
+      dir <- channelDir opts
+      names <- cursorNames dir
+      case names of
+        [name] -> pure name
+        [] -> do
+          hPutStrLn stderr $ "muster: no participants in " <> globalChannel opts
+          exitWith (ExitFailure 1)
+        _ -> do
+          hPutStrLn stderr $
+            "muster: ambiguous name; set MUSTER_NAME or pass NAME; candidates: "
+              <> intercalate ", " names
+          exitWith (ExitFailure 1)
+
+-- | Split post positionals into @(name, message)@.
+--
+-- Back-compat: @muster post NAME MSG...@ still works when @NAME@ is a known
+-- cursor (or equals @MUSTER_NAME@ / the sole cursor).  With identity resolved
+-- via env or sole cursor, all words are the message.
+resolvePostArgs :: Global -> [String] -> IO (String, Text)
+resolvePostArgs opts args = case args of
+  [] -> do
+    hPutStrLn stderr "muster: empty message"
+    exitWith (ExitFailure 1)
+  ws@(w : rest) -> do
+    menv <- lookupEnv "MUSTER_NAME"
+    dir <- channelDir opts
+    cursors <- cursorNames dir
+    let msg = T.pack . unwords
+    case menv of
+      Just n | not (null n) ->
+        -- Env wins. Strip a leading explicit self-name for back-compat.
+        if w == n && not (null rest)
+          then pure (n, msg rest)
+          else pure (n, msg ws)
+      _ -> case cursors of
+        [sole] ->
+          if w == sole && not (null rest)
+            then pure (sole, msg rest)
+            else pure (sole, msg ws)
+        _ ->
+          if w `elem` cursors && not (null rest)
+            then pure (w, msg rest)
+            else
+              if w `elem` cursors
+                then do
+                  hPutStrLn stderr "muster: empty message"
+                  exitWith (ExitFailure 1)
+                else do
+                  hPutStrLn stderr $
+                    "muster: ambiguous name; set MUSTER_NAME or pass NAME MSG; candidates: "
+                      <> intercalate ", " cursors
+                  exitWith (ExitFailure 1)
 
 -- | Initialise a watch cursor from the participant's join cursor, or from the
 -- current log length if no join cursor exists.
@@ -378,8 +460,8 @@ main = do
     CmdBus bc -> runBus opts bc
     CmdJoin name -> runJoin opts name
     CmdLeave name -> runLeave opts name
-    CmdPost name msg -> runPost opts name msg
-    CmdRead name -> runRead opts name
+    CmdPost args -> runPost opts args
+    CmdRead mname -> runRead opts mname
     CmdWatch mname mto -> runWatch opts mname mto
     CmdNames -> runNames opts
     CmdLog -> runLog opts
