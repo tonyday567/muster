@@ -41,6 +41,7 @@ The binary lives at `~/.cabal/bin/muster`. State lives under `~/mg/logs/muster/<
 | `log` | — | dump full channel log |
 | `channels` | — | list all channels (name, lines, participants, bus status) |
 | `clean` | `<channel> [-y]` | wipe channel (cursors/log/fifo); bus must be down; confirms unless `-y` |
+| `prune` | `<channel> [--keep N] [-y]` | archive old lines to log-archive.md, keep last N (default 100), reset cursors; bus must be down |
 
 **Global flags:** `-c, --channel CHANNEL` (default: `general`), `--bus-root DIR` (default: `$HOME/mg/logs/muster`)
 

@@ -113,6 +113,7 @@ data Cmd
   | CmdLog
   | CmdChannels
   | CmdClean String Bool
+  | CmdPrune String Int Bool
   deriving (Show)
 
 nameArg :: Parser String
@@ -160,6 +161,17 @@ yesOpt =
         <> help "Skip confirmation prompt"
     )
 
+keepOpt :: Parser Int
+keepOpt =
+  option
+    auto
+    ( long "keep"
+        <> metavar "N"
+        <> value 100
+        <> showDefault
+        <> help "Number of newest log lines to retain"
+    )
+
 cmdParser :: Parser Cmd
 cmdParser =
   hsubparser
@@ -187,6 +199,12 @@ cmdParser =
           ( info
               (CmdClean <$> channelArg <*> yesOpt)
               (progDesc "Wipe a channel (bus must be stopped; confirms unless -y)")
+          )
+        <> command
+          "prune"
+          ( info
+              (CmdPrune <$> channelArg <*> keepOpt <*> yesOpt)
+              (progDesc "Archive old log lines, keep last N, reset cursors (bus must be stopped)")
           )
     )
 
@@ -460,6 +478,114 @@ runClean opts channel yes = do
       <> show nParts
       <> " participants gone)"
 
+-- | Archive old log lines, retain the newest @keep@, reset join/watch cursors.
+--
+-- Bus must be down (rewriting @log.md@ under a live daemon races).  Dropped
+-- lines are appended to @log-archive.md@ with a separator header.
+runPrune :: Global -> String -> Int -> Bool -> IO ()
+runPrune opts channel keep yes = do
+  when (null channel || any isSpace channel || channel == "." || channel == "..") do
+    hPutStrLn stderr $ "muster: invalid channel '" <> channel <> "'"
+    exitWith (ExitFailure 1)
+  when ("_" `isPrefixOf` channel) do
+    hPutStrLn stderr $ "muster: refusing to prune reserved path '" <> channel <> "'"
+    exitWith (ExitFailure 1)
+  when (keep < 0) do
+    hPutStrLn stderr "muster: --keep must be >= 0"
+    exitWith (ExitFailure 1)
+  root <- busRoot opts
+  let dir = root </> channel
+      logPath = logFile dir
+      archivePath = dir </> "log-archive.md"
+  exists <- doesDirectoryExist dir
+  unless exists do
+    hPutStrLn stderr $ "muster: no channel directory " <> dir
+    exitWith (ExitFailure 1)
+  live <- MB.busLiveness dir
+  unless (live == "down") do
+    hPutStrLn stderr $
+      "muster: bus is "
+        <> live
+        <> " on "
+        <> channel
+        <> " — stop it first (muster -c "
+        <> channel
+        <> " bus stop)"
+    exitWith (ExitFailure 1)
+  hasLog <- doesFileExist logPath
+  if not hasLog
+    then putStrLn $ "prune: no log.md in " <> channel <> " — nothing to do"
+    else do
+      raw <- TIO.readFile logPath
+      let ls = T.lines raw
+          total = length ls
+          dropN = max 0 (total - keep)
+          (dropped, kept) = splitAt dropN ls
+      if dropN == 0
+        then
+          putStrLn $
+            "prune: "
+              <> channel
+              <> " already within keep="
+              <> show keep
+              <> " ("
+              <> show total
+              <> " lines)"
+        else do
+          unless yes do
+            putStr $
+              "Prune "
+                <> channel
+                <> " (drop "
+                <> show dropN
+                <> ", keep "
+                <> show (length kept)
+                <> " of "
+                <> show total
+                <> ")? [y/N] "
+            hFlush stdout
+            ans <- getLine
+            unless (ans == "y" || ans == "Y" || ans == "yes") do
+              putStrLn "aborted"
+              exitWith (ExitFailure 1)
+          let archiveHeader =
+                T.pack $
+                  "\n--- pruned keep="
+                    <> show keep
+                    <> " dropped="
+                    <> show dropN
+                    <> " from="
+                    <> show total
+                    <> " ---\n"
+              archived = archiveHeader <> T.unlines dropped
+              newLog =
+                if null kept
+                  then ""
+                  else T.unlines kept
+          TIO.appendFile archivePath archived
+          TIO.writeFile logPath newLog
+          -- Reset join + watch cursors to the new tail so nothing re-fires as "new".
+          entries <- listDirectory dir
+          let cursors =
+                [ e
+                | e <- entries
+                , ".cursor-" `isPrefixOf` e || ".watch-" `isPrefixOf` e
+                ]
+              newPos = length kept
+          mapM_ (\e -> writeFile (dir </> e) (show newPos <> "\n")) cursors
+          putStrLn $
+            "pruned "
+              <> channel
+              <> ": dropped "
+              <> show dropN
+              <> ", kept "
+              <> show newPos
+              <> ", archived → "
+              <> archivePath
+              <> ", reset "
+              <> show (length cursors)
+              <> " cursors"
+
 -- | List every channel under the bus root that has a @log.md@.
 --
 -- Output (aligned columns):
@@ -550,3 +676,4 @@ main = do
     CmdLog -> runLog opts
     CmdChannels -> runChannels opts
     CmdClean channel yes -> runClean opts channel yes
+    CmdPrune channel keep yes -> runPrune opts channel keep yes
