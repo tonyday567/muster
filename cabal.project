@@ -1,5 +1,6 @@
 packages:
   ./muster.cabal
-  ../cursor
+  ../circuits-repl
+  ../circuits/circuits.cabal
 
 write-ghc-environment-files: always
