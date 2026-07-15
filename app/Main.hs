@@ -11,7 +11,9 @@
 -- invoked from this binary.
 module Main (main) where
 
-import Control.Monad (unless, when)
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, try)
+import Control.Monad (unless, void, when)
 import Data.Char (isSpace)
 import Data.List (intercalate, isPrefixOf, sort)
 import Data.Maybe (fromMaybe)
@@ -25,6 +27,13 @@ import System.Environment (getEnv, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO
+import System.Process
+  ( CreateProcess (..),
+    StdStream (..),
+    createProcess,
+    proc,
+    waitForProcess,
+  )
 import Text.Read (readMaybe)
 import Prelude
 
@@ -102,6 +111,13 @@ logFile dir = dir </> "log.md"
 
 data BusCmd = BusStart | BusStop | BusStatus | BusDaemon deriving (Show, Eq)
 
+data AgentCmd
+  = AgentNew String (Maybe String) (Maybe String)
+  | AgentStop String
+  | AgentStatus (Maybe String)
+  | AgentList
+  deriving (Show)
+
 data Cmd
   = CmdBus BusCmd
   | CmdJoin String
@@ -114,6 +130,7 @@ data Cmd
   | CmdChannels
   | CmdClean String Bool
   | CmdPrune String Int Bool
+  | CmdAgent AgentCmd
   deriving (Show)
 
 nameArg :: Parser String
@@ -206,6 +223,12 @@ cmdParser =
               (CmdPrune <$> channelArg <*> keepOpt <*> yesOpt)
               (progDesc "Archive old log lines, keep last N, reset cursors (bus must be stopped)")
           )
+        <> command
+          "agent"
+          ( info
+              (CmdAgent <$> agentCmdParser)
+              (progDesc "Agent lifecycle (muster-agent)")
+          )
     )
 
 busCmdParser :: Parser BusCmd
@@ -215,6 +238,58 @@ busCmdParser =
         <> command "stop" (info (pure BusStop) (progDesc "Stop the bus daemon"))
         <> command "status" (info (pure BusStatus) (progDesc "Report bus health"))
         <> command "daemon" (info (pure BusDaemon) (progDesc "Internal: run the bus relay loop"))
+    )
+
+agentModelOpt :: Parser (Maybe String)
+agentModelOpt =
+  optional $
+    strOption
+      ( long "model"
+          <> short 'm'
+          <> metavar "MODEL"
+          <> help "Hermes model (default: deepseek-v4-pro or HERMES_MODEL)"
+      )
+
+agentProviderOpt :: Parser (Maybe String)
+agentProviderOpt =
+  optional $
+    strOption
+      ( long "provider"
+          <> metavar "PROVIDER"
+          <> help "Hermes provider (default: deepseek or HERMES_PROVIDER)"
+      )
+
+agentCmdParser :: Parser AgentCmd
+agentCmdParser =
+  hsubparser
+    ( command
+        "new"
+        ( info
+            ( AgentNew
+                <$> nameArg
+                <*> agentModelOpt
+                <*> agentProviderOpt
+            )
+            (progDesc "Start muster-agent for NAME")
+        )
+        <> command
+          "stop"
+          ( info
+              (AgentStop <$> nameArg)
+              (progDesc "Stop agent NAME (kill bridge PID)")
+          )
+        <> command
+          "status"
+          ( info
+              (AgentStatus <$> optionalNameArg)
+              (progDesc "Report agent status (one NAME or all)")
+          )
+        <> command
+          "list"
+          ( info
+              (pure AgentList)
+              (progDesc "List agents under bus-root/agents/")
+          )
     )
 
 data Options = Options Global Cmd
@@ -662,6 +737,186 @@ validateName name
       hPutStrLn stderr $ "muster: invalid name '" <> name <> "': " <> msg
       exitWith (ExitFailure 1)
 
+-- ---------------------------------------------------------------------------
+-- Agent lifecycle (muster-agent)
+-- ---------------------------------------------------------------------------
+
+agentsRoot :: Global -> IO FilePath
+agentsRoot opts = (</> "agents") <$> busRoot opts
+
+agentDir :: Global -> String -> IO FilePath
+agentDir opts name = (</> name) <$> agentsRoot opts
+
+pidAlive :: Int -> IO Bool
+pidAlive pid = do
+  r <- try @IOException $ do
+    (_, _, _, ph) <-
+      createProcess
+        (proc "kill" ["-0", show pid])
+          { std_in = NoStream,
+            std_out = NoStream,
+            std_err = NoStream
+          }
+    waitForProcess ph
+  pure $ case r of
+    Right ExitSuccess -> True
+    _ -> False
+
+readPidInt :: FilePath -> IO (Maybe Int)
+readPidInt path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      raw <- readFile path
+      pure $ readMaybe (filter (not . isSpace) raw)
+
+killPid :: Int -> IO ()
+killPid pid = void $ do
+  (_, _, _, ph) <-
+    createProcess
+      (proc "kill" [show pid])
+        { std_in = NoStream,
+          std_out = NoStream,
+          std_err = NoStream
+        }
+  waitForProcess ph
+
+-- | Start the long-lived Haskell agent bridge.
+runAgentNew :: Global -> String -> Maybe String -> Maybe String -> IO ()
+runAgentNew opts name mModel mProvider = do
+  validateName name
+  -- join channel so bus identity exists
+  runJoin opts name
+  adir <- agentDir opts name
+  createDirectoryIfMissing True adir
+  let pidPath = adir </> "agent.pid"
+      logPath = adir </> "bridge.log"
+      cfgPath = adir </> "config"
+  mpid <- readPidInt pidPath
+  case mpid of
+    Just p -> do
+      alive <- pidAlive p
+      when alive do
+        hPutStrLn stderr $ "muster: agent " <> name <> " already running (pid " <> show p <> ")"
+        exitWith (ExitFailure 1)
+    Nothing -> pure ()
+  homeModel <- lookupEnv "HERMES_MODEL"
+  homeProv <- lookupEnv "HERMES_PROVIDER"
+  let model = fromMaybe (fromMaybe "deepseek-v4-pro" homeModel) mModel
+      provider = fromMaybe (fromMaybe "deepseek" homeProv) mProvider
+  writeFile cfgPath $
+    unlines
+      [ "name=" <> name,
+        "model=" <> model,
+        "provider=" <> provider
+      ]
+  let busRootArg = case globalBusRoot opts of
+        "" -> []
+        r -> ["--bus-root", r]
+      args =
+        busRootArg
+          <> ["--channel", globalChannel opts]
+          <> ["--name", name]
+          <> ["--model", model]
+          <> ["--provider", provider]
+      sh =
+        "nohup muster-agent "
+          <> unwords (map show args)
+          <> " >> "
+          <> show logPath
+          <> " 2>&1 & echo $! > "
+          <> show pidPath
+  (_, _, _, ph) <-
+    createProcess
+      (proc "/bin/sh" ["-c", sh]) {std_in = NoStream}
+  void $ waitForProcess ph
+  threadDelay 400000
+  mpid' <- readPidInt pidPath
+  case mpid' of
+    Just p -> do
+      alive <- pidAlive p
+      if alive
+        then putStrLn $ "[agent " <> name <> "] started pid " <> show p
+        else do
+          hPutStrLn stderr $ "muster: agent " <> name <> " died — see " <> logPath
+          exitWith (ExitFailure 1)
+    Nothing -> do
+      hPutStrLn stderr $ "muster: agent " <> name <> " pid not written — see " <> logPath
+      exitWith (ExitFailure 1)
+
+runAgentStop :: Global -> String -> IO ()
+runAgentStop opts name = do
+  validateName name
+  adir <- agentDir opts name
+  let pidPath = adir </> "agent.pid"
+  mpid <- readPidInt pidPath
+  case mpid of
+    Nothing -> putStrLn $ "[agent " <> name <> "] not running (no pidfile)"
+    Just p -> do
+      alive <- pidAlive p
+      if alive
+        then do
+          killPid p
+          threadDelay 200000
+          -- if still alive, SIGKILL
+          still <- pidAlive p
+          when still $ void $ do
+            (_, _, _, ph) <-
+              createProcess
+                (proc "kill" ["-9", show p])
+                  { std_in = NoStream,
+                    std_out = NoStream,
+                    std_err = NoStream
+                  }
+            waitForProcess ph
+          removeFile pidPath
+          putStrLn $ "[agent " <> name <> "] stopped (was pid " <> show p <> ")"
+        else do
+          removeFile pidPath
+          putStrLn $ "[agent " <> name <> "] stale pid " <> show p <> " removed"
+
+runAgentStatusOne :: Global -> String -> IO ()
+runAgentStatusOne opts name = do
+  adir <- agentDir opts name
+  let pidPath = adir </> "agent.pid"
+      cfgPath = adir </> "config"
+  exists <- doesDirectoryExist adir
+  if not exists
+    then putStrLn $ name <> "  no agent dir"
+    else do
+      mpid <- readPidInt pidPath
+      state <- case mpid of
+        Nothing -> pure "down"
+        Just p -> do
+          alive <- pidAlive p
+          pure $ if alive then "alive (pid " <> show p <> ")" else "stale (pid " <> show p <> ")"
+      cfg <- doesFileExist cfgPath >>= \case
+        True -> intercalate " " . filter (not . null) . lines <$> readFile cfgPath
+        False -> pure ""
+      putStrLn $ name <> "  " <> state <> if null cfg then "" else "  " <> take 100 cfg
+
+runAgentList :: Global -> IO ()
+runAgentList opts = do
+  root <- agentsRoot opts
+  exists <- doesDirectoryExist root
+  if not exists
+    then putStrLn "no agents/"
+    else do
+      entries <- listDirectory root
+      let names = sort [e | e <- entries, not ("_" `isPrefixOf` e)]
+      if null names
+        then putStrLn "no agents"
+        else mapM_ (runAgentStatusOne opts) names
+
+runAgent :: Global -> AgentCmd -> IO ()
+runAgent opts = \case
+  AgentNew name mModel mProvider -> runAgentNew opts name mModel mProvider
+  AgentStop name -> runAgentStop opts name
+  AgentStatus Nothing -> runAgentList opts
+  AgentStatus (Just name) -> runAgentStatusOne opts name
+  AgentList -> runAgentList opts
+
 main :: IO ()
 main = do
   Options opts cmd <- execParser optionsParser
@@ -677,3 +932,4 @@ main = do
     CmdChannels -> runChannels opts
     CmdClean channel yes -> runClean opts channel yes
     CmdPrune channel keep yes -> runPrune opts channel keep yes
+    CmdAgent ac -> runAgent opts ac

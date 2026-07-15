@@ -86,3 +86,21 @@ executable muster
 
     -- Base language which the package is written in.
     default-language: GHC2021
+
+executable muster-agent
+    import:           warnings
+
+    main-is:          AgentBridge.hs
+
+    build-depends:
+        base,
+        circuits-repl,
+        optparse-applicative,
+        text,
+        directory,
+        filepath,
+        process
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
