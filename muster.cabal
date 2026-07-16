@@ -90,7 +90,7 @@ executable muster
 executable muster-agent
     import:           warnings
 
-    main-is:          AgentBridge.hs
+    main-is:          MusterAgent.hs
 
     build-depends:
         base,
