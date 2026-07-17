@@ -48,13 +48,14 @@ import System.IO
     IOMode (..),
     hClose,
     hFlush,
-    hGetLine,
     hIsEOF,
     hPutStrLn,
     hSetBuffering,
+    hSetEncoding,
     openFile,
     stderr,
     stdout,
+    utf8,
   )
 import System.Posix.Files (createNamedPipe, stdFileMode)
 import System.Posix.IO
@@ -202,21 +203,24 @@ busDaemon dir = do
   -- between messages (posix @open(O_RDWR)@ ≡ bash @cat \<>fifo@).
   fd <- openFd (mbFifo p) ReadWrite defaultFileFlags
   h <- fdToHandle fd
+  hSetEncoding h utf8
   hSetBuffering h LineBuffering
   logH <- openFile (mbLog p) AppendMode
+  hSetEncoding logH utf8
   hSetBuffering logH NoBuffering
   self <- getProcessID
   writeFile (mbPid p) (show (pidToInt self) <> "\n")
   relay h logH `finally` (hClose h >> hClose logH)
   where
+    -- Text + utf8: String hGetLine/hPutStrLn mojibake emoji/marks (ðŸ / â).
     relay :: Handle -> Handle -> IO ()
     relay h logH = forever do
       eof <- hIsEOF h
       if eof
         then threadDelay 100000 -- should not happen with RDWR; back off
         else do
-          line <- hGetLine h
-          hPutStrLn logH line
+          line <- TIO.hGetLine h
+          TIO.hPutStrLn logH line
           hFlush logH
 
 -- ---------------------------------------------------------------------------
@@ -337,6 +341,7 @@ post dir sender body = do
       before <- countNewlines (mbLog p)
       let framed = T.pack ("[" <> sender <> "] ") <> body <> "\n"
       bracket (openFile (mbFifo p) WriteMode) hClose \h -> do
+        hSetEncoding h utf8
         hSetBuffering h NoBuffering
         TIO.hPutStr h framed
         hFlush h
