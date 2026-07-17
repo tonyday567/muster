@@ -13,58 +13,115 @@
       --accent: #4B7FBD;
       --link: #C44E8A;
       --live: #3fa47e;
+      --warn: #D98A3A;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       background: var(--bg);
       color: var(--text);
-      font: 15px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font: 14px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       height: 100vh;
-      display: flex;
-      flex-direction: column;
-      padding: 0.75rem;
+      display: grid;
+      grid-template-columns: minmax(240px, 320px) 1fr;
+      grid-template-rows: auto 1fr auto;
       gap: 0.5rem;
+      padding: 0.6rem;
     }
     header {
+      grid-column: 1 / -1;
       display: flex;
       align-items: center;
       gap: 0.75rem;
       color: var(--muted);
       font-size: 0.85rem;
       border-bottom: 1px solid var(--border);
-      padding-bottom: 0.5rem;
+      padding-bottom: 0.45rem;
     }
     header strong { color: var(--accent); font-weight: 600; }
     #status { color: var(--muted); }
     #status.ok { color: var(--live); }
     #status.bad { color: var(--link); }
+    aside {
+      grid-row: 2;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-height: 0;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5rem 0.6rem;
+      overflow: auto;
+      min-height: 0;
+    }
+    .panel h2 {
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 0.4rem;
+    }
+    #projects { flex: 1; }
+    #agents { flex: 1; }
+    .proj, .agent {
+      padding: 0.25rem 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.82rem;
+    }
+    .proj:last-child, .agent:last-child { border-bottom: none; }
+    .proj a { color: var(--link); text-decoration: none; }
+    .proj a:hover { text-decoration: underline; }
+    .agent .name { color: var(--heading, var(--text)); font-weight: 600; }
+    .agent .meta { color: var(--muted); font-size: 0.75rem; }
+    .agent .last {
+      color: var(--text);
+      opacity: 0.85;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+    .dot { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.35rem; }
+    .dot.alive { background: var(--live); }
+    .dot.stale { background: var(--warn); }
+    .dot.down { background: var(--muted); }
+    main {
+      grid-row: 2;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
     #log {
       flex: 1;
       overflow-y: auto;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 0.6rem 0.75rem;
+      padding: 0.55rem 0.7rem;
       white-space: pre-wrap;
       word-break: break-word;
+      min-height: 0;
     }
-    #log .line { margin: 0.15rem 0; }
+    #log .line { margin: 0.12rem 0; }
     form {
+      grid-column: 1 / -1;
       display: flex;
       flex-direction: column;
-      gap: 0.4rem;
+      gap: 0.35rem;
       border-top: 1px solid var(--border);
-      padding-top: 0.5rem;
+      padding-top: 0.45rem;
     }
     textarea {
       width: 100%;
-      min-height: 4.5rem;
+      min-height: 4rem;
       resize: vertical;
       background: var(--surface);
       color: var(--text);
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 0.5rem 0.6rem;
+      padding: 0.45rem 0.55rem;
       font: inherit;
     }
     textarea:focus { outline: 1px solid var(--accent); }
@@ -74,18 +131,17 @@
       color: #fff;
       border: none;
       border-radius: 6px;
-      padding: 0.4rem 0.9rem;
+      padding: 0.35rem 0.85rem;
       font: inherit;
       cursor: pointer;
     }
-    button:disabled { opacity: 0.4; cursor: default; }
     input#wsurl {
       flex: 1;
       background: var(--surface);
       color: var(--muted);
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 0.3rem 0.5rem;
+      padding: 0.25rem 0.45rem;
       font: inherit;
     }
   </style>
@@ -97,12 +153,24 @@
     <input id="wsurl" value="" placeholder="ws url" />
     <button type="button" id="reconnect">reconnect</button>
   </header>
-  <div id="log"></div>
+  <aside>
+    <div class="panel" id="projects">
+      <h2>projects · board</h2>
+      <div id="projList" class="muted">loading…</div>
+    </div>
+    <div class="panel" id="agents">
+      <h2>agents</h2>
+      <div id="agentList">loading…</div>
+    </div>
+  </aside>
+  <main>
+    <div id="log"></div>
+  </main>
   <form id="compose">
-    <textarea id="msg" placeholder="type → bus (⌘/Ctrl+Enter to send)"></textarea>
+    <textarea id="msg" placeholder="type → bus (⌘/Ctrl+Enter) · @name for agents"></textarea>
     <div class="row">
       <button type="submit" id="send">send</button>
-      <span style="color:var(--muted);font-size:0.8rem">same bus as muster post/read · @name to agents</span>
+      <span style="color:var(--muted);font-size:0.78rem">board + agents poll /api/state · same bus as muster</span>
     </div>
   </form>
   <script>
@@ -110,6 +178,8 @@
     const statusEl = document.getElementById('status');
     const msgEl = document.getElementById('msg');
     const urlEl = document.getElementById('wsurl');
+    const projList = document.getElementById('projList');
+    const agentList = document.getElementById('agentList');
     let ws;
     let backoff = 500;
 
@@ -133,6 +203,51 @@
       statusEl.className = cls || '';
     }
 
+    function linkifyProject(line) {
+      // [name](path) markdown links
+      const m = line.match(/\[([^\]]+)\]\(([^)]+)\)/);
+      if (!m) return escapeHtml(line);
+      const rest = line.replace(m[0], '');
+      // file links are local; show path as title
+      return `<a href="#" title="${escapeHtml(m[2])}" data-path="${escapeHtml(m[2])}">${escapeHtml(m[1])}</a>${escapeHtml(rest)}`;
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function refreshState() {
+      try {
+        const r = await fetch('/api/state', { cache: 'no-store' });
+        if (!r.ok) throw new Error(r.status);
+        const st = await r.json();
+        if (st.projects && st.projects.length) {
+          projList.innerHTML = st.projects.map(p =>
+            `<div class="proj">${linkifyProject(p)}</div>`
+          ).join('');
+        } else if (st.board) {
+          projList.innerHTML = `<pre style="white-space:pre-wrap;font:inherit;margin:0">${escapeHtml(st.board)}</pre>`;
+        } else {
+          projList.textContent = '(no board lines)';
+        }
+        if (st.agents && st.agents.length) {
+          agentList.innerHTML = st.agents.map(a => {
+            const last = a.last || '';
+            const short = last.length > 90 ? last.slice(0, 90) + '…' : last;
+            return `<div class="agent">
+              <div><span class="dot ${escapeHtml(a.status)}"></span><span class="name">${escapeHtml(a.name)}</span>
+              <span class="meta"> ${escapeHtml(a.status)}${a.pid ? ' · ' + a.pid : ''}${a.model ? ' · ' + escapeHtml(a.model) : ''}</span></div>
+              <div class="last" title="${escapeHtml(last)}">${escapeHtml(short || '—')}</div>
+            </div>`;
+          }).join('');
+        } else {
+          agentList.textContent = '(no agents/)';
+        }
+      } catch (e) {
+        projList.textContent = 'state fetch failed';
+      }
+    }
+
     function connect() {
       if (ws) try { ws.close(); } catch (_) {}
       const url = urlEl.value.trim() || defaultWsUrl();
@@ -141,6 +256,7 @@
       ws.onopen = () => {
         setStatus('ws open', 'ok');
         backoff = 500;
+        refreshState();
       };
       ws.onclose = () => {
         setStatus('ws closed — retrying', 'bad');
@@ -148,7 +264,11 @@
         backoff = Math.min(backoff * 1.5, 8000);
       };
       ws.onerror = () => setStatus('ws error', 'bad');
-      ws.onmessage = (ev) => append(ev.data);
+      ws.onmessage = (ev) => {
+        append(ev.data);
+        // light refresh on traffic
+        if (Math.random() < 0.15) refreshState();
+      };
     }
 
     document.getElementById('compose').onsubmit = (e) => {
@@ -170,8 +290,17 @@
       backoff = 500;
       connect();
     };
+
+    projList.addEventListener('click', (e) => {
+      const a = e.target.closest('a[data-path]');
+      if (!a) return;
+      e.preventDefault();
+      // show path; local file open is host-dependent
+      append('¬ board card: ' + a.dataset.path);
+    });
+
     connect();
+    setInterval(refreshState, 5000);
   </script>
 </body>
 </html>
-
