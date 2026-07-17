@@ -2,8 +2,8 @@
 
 -- | Bare-bones WebSocket face on a muster channel.
 --
--- 'Circuit.Socket' (circuits-io) + 'attachMusterRepl' (circuits-repl).
--- Browser text → bus commit; bus emit → browser.
+-- 'Circuit.Socket' (circuits-io) + 'Circuit.Comm' channel attach.
+-- Browser text → bus; all bus lines (including self) → browser.
 --
 -- @
 --   cabal run muster-ws -- --name desk
@@ -11,8 +11,15 @@
 -- @
 module Main where
 
-import Circuit.Comm (ChannelConfig (..), attachMusterRepl)
-import Circuit.Repl (Repl, replClose, replCommit, replEmit)
+import Circuit.Comm
+  ( Channel,
+    ChannelConfig (..),
+    channelAttach,
+    channelClose,
+    channelRecv,
+    channelSend,
+    frameMessage,
+  )
 import Circuit.Socket
   ( SocketConfig (..),
     defaultSocketConfig,
@@ -90,12 +97,13 @@ main = do
     error $
       "bus.fifo missing at " <> fifo <> " — run: muster bus start -c " <> optChannel o
 
-  let cfg =
+  let name = T.pack (optName o)
+      cfg =
         ChannelConfig
           { chStdinPath = fifo,
             chStdoutPath = logf,
             chStderrPath = dir </> "err.md",
-            chName = T.pack (optName o),
+            chName = name,
             chWorkingDir = dir
           }
       sock =
@@ -108,15 +116,15 @@ main = do
   putStrLn $ "muster-ws: attaching as " <> optName o <> " on " <> optChannel o
   putStrLn $ "  log  " <> logf
   putStrLn $ "  ws   ws://" <> T.unpack (optHost o) <> ":" <> show (optPort o) <> "/"
-  putStrLn "  open app/deck.html"
+  putStrLn "  open app/deck.html  (self-echo on — your posts show in the scroll)"
   hFlush stdout
 
-  bracket (attachMusterRepl cfg) replClose $ \repl -> do
+  bracket (channelAttach cfg) channelClose $ \ch -> do
     busFan <- newBroadcastTChanIO
-    void $ async $ busPump repl busFan
+    void $ async $ busPump ch busFan
     withWSServer sock $
       wsServerApp $ \conn ->
-        clientSession repl busFan conn
+        clientSession ch name busFan conn
 
 resolveRoot :: FilePath -> IO FilePath
 resolveRoot explicit
@@ -127,14 +135,19 @@ resolveRoot explicit
         Just d | not (null d) -> pure d
         _ -> (</> "mg/logs/muster") <$> getEnv "HOME"
 
-busPump :: Repl -> TChan Text -> IO ()
-busPump repl fan = forever $ do
-  lines' <- replEmit repl
-  mapM_ (\t -> atomically $ writeTChan fan t) lines'
-  when (null lines') $ threadDelay 50_000
+-- | All framed lines, including our own (unlike muster watch / attachMusterRepl).
+busPump :: Channel -> TChan Text -> IO ()
+busPump ch fan = forever $ do
+  msgs <- channelRecv ch
+  mapM_
+    ( \(sender, body) ->
+        atomically $ writeTChan fan (frameMessage sender body)
+    )
+    msgs
+  when (null msgs) $ threadDelay 50_000
 
-clientSession :: Repl -> TChan Text -> Connection -> IO ()
-clientSession repl fan conn = do
+clientSession :: Channel -> Text -> TChan Text -> Connection -> IO ()
+clientSession ch name fan conn = do
   inQ <- newTQueueIO
   outQ <- newTQueueIO
   myFan <- atomically $ dupTChan fan
@@ -144,8 +157,10 @@ clientSession repl fan conn = do
   tPost <- async $ forever $ do
     t <- atomically $ readTQueue inQ
     let body = T.strip t
-    when (not (T.null body)) $
-      replCommit repl [body]
+    when (not (T.null body)) $ do
+      channelSend ch body
+      -- immediate local echo so the desk never waits on fanout timing
+      atomically $ writeTQueue outQ (frameMessage name body)
   wsDuplex conn inQ outQ
     `finally` do
       cancel tFan
