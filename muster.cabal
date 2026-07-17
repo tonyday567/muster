@@ -115,11 +115,15 @@ executable muster-ws
         async,
         circuits-io,
         circuits-repl,
+        http-types,
         optparse-applicative,
         stm,
         text,
         directory,
         filepath,
+        wai,
+        wai-websockets,
+        warp,
         websockets
 
     hs-source-dirs:   app

@@ -94,7 +94,7 @@
   <header>
     <strong>⚛ muster desk</strong>
     <span id="status">connecting…</span>
-    <input id="wsurl" value="ws://127.0.0.1:9162/" />
+    <input id="wsurl" value="" placeholder="ws url" />
     <button type="button" id="reconnect">reconnect</button>
   </header>
   <div id="log"></div>
@@ -102,7 +102,7 @@
     <textarea id="msg" placeholder="type → bus (⌘/Ctrl+Enter to send)"></textarea>
     <div class="row">
       <button type="submit" id="send">send</button>
-      <span style="color:var(--muted);font-size:0.8rem">same bus as muster post/read</span>
+      <span style="color:var(--muted);font-size:0.8rem">same bus as muster post/read · @name to agents</span>
     </div>
   </form>
   <script>
@@ -111,6 +111,14 @@
     const msgEl = document.getElementById('msg');
     const urlEl = document.getElementById('wsurl');
     let ws;
+    let backoff = 500;
+
+    function defaultWsUrl() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      if (location.host) return proto + '//' + location.host + '/';
+      return 'ws://127.0.0.1:9162/';
+    }
+    if (!urlEl.value) urlEl.value = defaultWsUrl();
 
     function append(line) {
       const d = document.createElement('div');
@@ -127,11 +135,18 @@
 
     function connect() {
       if (ws) try { ws.close(); } catch (_) {}
-      const url = urlEl.value.trim();
+      const url = urlEl.value.trim() || defaultWsUrl();
       setStatus('connecting…');
       ws = new WebSocket(url);
-      ws.onopen = () => setStatus('ws open', 'ok');
-      ws.onclose = () => setStatus('ws closed', 'bad');
+      ws.onopen = () => {
+        setStatus('ws open', 'ok');
+        backoff = 500;
+      };
+      ws.onclose = () => {
+        setStatus('ws closed — retrying', 'bad');
+        setTimeout(connect, backoff);
+        backoff = Math.min(backoff * 1.5, 8000);
+      };
       ws.onerror = () => setStatus('ws error', 'bad');
       ws.onmessage = (ev) => append(ev.data);
     }
@@ -151,8 +166,12 @@
       }
     });
 
-    document.getElementById('reconnect').onclick = connect;
+    document.getElementById('reconnect').onclick = () => {
+      backoff = 500;
+      connect();
+    };
     connect();
   </script>
 </body>
 </html>
+
