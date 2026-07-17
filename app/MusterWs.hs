@@ -147,7 +147,7 @@ busPump ch fan = forever $ do
   when (null msgs) $ threadDelay 50_000
 
 clientSession :: Channel -> Text -> TChan Text -> Connection -> IO ()
-clientSession ch name fan conn = do
+clientSession ch _name fan conn = do
   inQ <- newTQueueIO
   outQ <- newTQueueIO
   myFan <- atomically $ dupTChan fan
@@ -157,10 +157,9 @@ clientSession ch name fan conn = do
   tPost <- async $ forever $ do
     t <- atomically $ readTQueue inQ
     let body = T.strip t
-    when (not (T.null body)) $ do
+    -- No watch-style exclude-self: busPump fans [desk] lines back via channelRecv.
+    when (not (T.null body)) $
       channelSend ch body
-      -- immediate local echo so the desk never waits on fanout timing
-      atomically $ writeTQueue outQ (frameMessage name body)
   wsDuplex conn inQ outQ
     `finally` do
       cancel tFan
