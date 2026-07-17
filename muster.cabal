@@ -104,3 +104,24 @@ executable muster-agent
     hs-source-dirs:   app
 
     default-language: GHC2021
+
+executable muster-ws
+    import:           warnings
+
+    main-is:          MusterWs.hs
+
+    build-depends:
+        base,
+        async,
+        circuits-io,
+        circuits-repl,
+        optparse-applicative,
+        stm,
+        text,
+        directory,
+        filepath,
+        websockets
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
