@@ -19,13 +19,13 @@
     body {
       background: var(--bg);
       color: var(--text);
-      font: 14px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, "Apple Color Emoji", "Segoe UI Emoji", monospace;
       height: 100vh;
       display: grid;
-      grid-template-columns: minmax(240px, 320px) 1fr;
+      grid-template-columns: minmax(180px, 240px) 1fr;
       grid-template-rows: auto 1fr auto;
-      gap: 0.5rem;
-      padding: 0.6rem;
+      gap: 0.4rem;
+      padding: 0.4rem;
     }
     header {
       grid-column: 1 / -1;
@@ -63,8 +63,10 @@
       letter-spacing: 0.04em;
       margin-bottom: 0.4rem;
     }
-    #projects { flex: 1; }
-    #agents { flex: 1; }
+    #projects { flex: 0 0 auto; }
+    #agents { flex: 0 0 auto; }
+    #busPanel { flex: 0 0 auto; }
+    #busPanel .bus-name { color: var(--accent); margin-right: 0.6rem; }
     .proj, .agent {
       padding: 0.25rem 0;
       border-bottom: 1px solid var(--border);
@@ -87,6 +89,14 @@
     .dot.alive { background: var(--live); }
     .dot.stale { background: var(--warn); }
     .dot.down { background: var(--muted); }
+    .badge {
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.72rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      margin-right: 0.4rem;
+    }
     main {
       grid-row: 2;
       display: flex;
@@ -135,32 +145,27 @@
       font: inherit;
       cursor: pointer;
     }
-    input#wsurl {
-      flex: 1;
-      background: var(--surface);
-      color: var(--muted);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.25rem 0.45rem;
-      font: inherit;
-    }
   </style>
-</head>
 <body>
   <header>
-    <strong>⚛ muster desk</strong>
-    <span id="status">connecting…</span>
-    <input id="wsurl" value="" placeholder="ws url" />
+    <strong>⚛ deck</strong>
+    <span id="channelBadge" class="badge"></span>
+    <span id="identityBadge" class="badge"></span>
+    <span id="status" class="dot down" title="connecting"></span>
     <button type="button" id="reconnect">reconnect</button>
   </header>
   <aside>
     <div class="panel" id="projects">
-      <h2>projects · board</h2>
+      <h2>board</h2>
       <div id="projList" class="muted">loading…</div>
     </div>
     <div class="panel" id="agents">
       <h2>agents</h2>
       <div id="agentList">loading…</div>
+    </div>
+    <div class="panel" id="busPanel">
+      <h2>bus</h2>
+      <div id="busBar"></div>
     </div>
   </aside>
   <main>
@@ -170,104 +175,135 @@
     <textarea id="msg" placeholder="type → bus (⌘/Ctrl+Enter) · @name for agents"></textarea>
     <div class="row">
       <button type="submit" id="send">send</button>
-      <span style="color:var(--muted);font-size:0.78rem">board + agents poll /api/state · same bus as muster</span>
     </div>
   </form>
   <script>
     const logEl = document.getElementById('log');
     const statusEl = document.getElementById('status');
     const msgEl = document.getElementById('msg');
-    const urlEl = document.getElementById('wsurl');
     const projList = document.getElementById('projList');
     const agentList = document.getElementById('agentList');
+    const channelBadge = document.getElementById('channelBadge');
+    const identityBadge = document.getElementById('identityBadge');
     let ws;
-    let backoff = 500;
+    let backoff = 2000;
+    let lastStateJson = '';
+    let intentionalClose = false;
 
     function defaultWsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       if (location.host) return proto + '//' + location.host + '/';
       return 'ws://127.0.0.1:9162/';
     }
-    if (!urlEl.value) urlEl.value = defaultWsUrl();
+
+    /** Only pin to bottom if the user is already near the end (or empty). */
+    function nearBottom(el, px) {
+      return el.scrollHeight - el.scrollTop - el.clientHeight < (px || 48);
+    }
 
     function append(line) {
+      const stick = nearBottom(logEl);
       const d = document.createElement('div');
       d.className = 'line';
       d.textContent = line;
       logEl.appendChild(d);
-      logEl.scrollTop = logEl.scrollHeight;
+      if (stick) logEl.scrollTop = logEl.scrollHeight;
     }
 
-    function setStatus(text, cls) {
-      statusEl.textContent = text;
-      statusEl.className = cls || '';
+    function clearLog() {
+      logEl.innerHTML = '';
+    }
+
+    function setStatus(cls, title) {
+      statusEl.className = 'dot ' + (cls || 'down');
+      statusEl.title = title || '';
     }
 
     function linkifyProject(line) {
-      // [name](path) markdown links
+      // [name](path) markdown links — show only the linked name
       const m = line.match(/\[([^\]]+)\]\(([^)]+)\)/);
       if (!m) return escapeHtml(line);
-      const rest = line.replace(m[0], '');
-      // file links are local; show path as title
-      return `<a href="#" title="${escapeHtml(m[2])}" data-path="${escapeHtml(m[2])}">${escapeHtml(m[1])}</a>${escapeHtml(rest)}`;
+      return `<a href="#" title="${escapeHtml(m[2])}" data-path="${escapeHtml(m[2])}">⧈ ${escapeHtml(m[1])}</a>`;
     }
 
     function escapeHtml(s) {
       return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
+    function renderState(st) {
+      if (st.projects && st.projects.length) {
+        projList.innerHTML = st.projects.map(p =>
+          `<div class="proj">${linkifyProject(p)}</div>`
+        ).join('');
+      } else if (st.board) {
+        projList.innerHTML = `<pre style="white-space:pre-wrap;font:inherit;margin:0">${escapeHtml(st.board)}</pre>`;
+      } else {
+        projList.textContent = '(no board lines)';
+      }
+      if (st.agents && st.agents.length) {
+        const names = new Set(st.agents.map(a => a.name));
+        // merge bus participants not already in agent list
+        const extra = (st.bus || []).filter(n => !names.has(n)).map(n => ({name: n, status: 'stale'}));
+        const all = [...st.agents, ...extra];
+        agentList.innerHTML = all.map(a =>
+          `<div class="agent"><span class="dot ${escapeHtml(a.status)}"></span><span class="name">${escapeHtml(a.name)}</span></div>`
+        ).join('');
+      } else {
+        agentList.textContent = '(no agents/)';
+      }
+      // bus status bar
+      const busBar = document.getElementById('busBar');
+      if (busBar && st.bus && st.bus.length) {
+        busBar.innerHTML = st.bus.map(n =>
+          `<span class="bus-name">@${escapeHtml(n)}</span>`
+        ).join('');
+      }
+      // channel + identity badges
+      if (st.channel) channelBadge.textContent = '#' + st.channel;
+      if (st.identity) identityBadge.textContent = '@' + st.identity;
+    }
+
     async function refreshState() {
       try {
         const r = await fetch('/api/state', { cache: 'no-store' });
         if (!r.ok) throw new Error(r.status);
-        const st = await r.json();
-        if (st.projects && st.projects.length) {
-          projList.innerHTML = st.projects.map(p =>
-            `<div class="proj">${linkifyProject(p)}</div>`
-          ).join('');
-        } else if (st.board) {
-          projList.innerHTML = `<pre style="white-space:pre-wrap;font:inherit;margin:0">${escapeHtml(st.board)}</pre>`;
-        } else {
-          projList.textContent = '(no board lines)';
-        }
-        if (st.agents && st.agents.length) {
-          agentList.innerHTML = st.agents.map(a => {
-            const last = a.last || '';
-            const short = last.length > 90 ? last.slice(0, 90) + '…' : last;
-            return `<div class="agent">
-              <div><span class="dot ${escapeHtml(a.status)}"></span><span class="name">${escapeHtml(a.name)}</span>
-              <span class="meta"> ${escapeHtml(a.status)}${a.pid ? ' · ' + a.pid : ''}${a.model ? ' · ' + escapeHtml(a.model) : ''}</span></div>
-              <div class="last" title="${escapeHtml(last)}">${escapeHtml(short || '—')}</div>
-            </div>`;
-          }).join('');
-        } else {
-          agentList.textContent = '(no agents/)';
-        }
+        const text = await r.text();
+        // skip DOM thrash when nothing changed
+        if (text === lastStateJson) return;
+        lastStateJson = text;
+        const st = JSON.parse(text);
+        renderState(st);
       } catch (e) {
-        projList.textContent = 'state fetch failed';
+        if (projList.textContent !== 'state fetch failed') {
+          projList.textContent = 'state fetch failed';
+        }
       }
     }
 
     function connect() {
-      if (ws) try { ws.close(); } catch (_) {}
-      const url = urlEl.value.trim() || defaultWsUrl();
-      setStatus('connecting…');
-      ws = new WebSocket(url);
+      if (ws) {
+        intentionalClose = true;
+        try { ws.close(); } catch (_) {}
+      }
+      intentionalClose = false;
+      setStatus('down', 'connecting…');
+      ws = new WebSocket(defaultWsUrl());
       ws.onopen = () => {
-        setStatus('ws open', 'ok');
-        backoff = 500;
+        setStatus('alive', 'connected');
+        backoff = 2000;
+        // server re-sends history on connect — clear first to avoid dups + scroll fight
+        clearLog();
         refreshState();
       };
       ws.onclose = () => {
-        setStatus('ws closed — retrying', 'bad');
+        setStatus('stale', 'reconnecting');
+        if (intentionalClose) return;
         setTimeout(connect, backoff);
         backoff = Math.min(backoff * 1.5, 8000);
       };
-      ws.onerror = () => setStatus('ws error', 'bad');
+      ws.onerror = () => setStatus('down', 'error');
       ws.onmessage = (ev) => {
         append(ev.data);
-        // light refresh on traffic
-        if (Math.random() < 0.15) refreshState();
       };
     }
 
@@ -295,12 +331,14 @@
       const a = e.target.closest('a[data-path]');
       if (!a) return;
       e.preventDefault();
-      // show path; local file open is host-dependent
-      append('¬ board card: ' + a.dataset.path);
+      const path = a.dataset.path;
+      // open file on server via /api/open
+      fetch('/api/open?path=' + encodeURIComponent(path)).catch(() => {});
     });
 
     connect();
-    setInterval(refreshState, 5000);
+    // sidebar only; 15s + skip-if-unchanged avoids thrash
+    setInterval(refreshState, 15000);
   </script>
 </body>
 </html>
