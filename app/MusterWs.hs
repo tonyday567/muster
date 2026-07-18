@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | WebSocket (+ HTTP) face on a muster channel.
@@ -26,18 +27,19 @@ import Control.Concurrent.STM
 import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad (forever, void, when)
 import Data.ByteString.Lazy qualified as LBS
-import Data.List (foldl')
+import Data.FileEmbed (embedFile)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Text.IO qualified as TIO
-import Network.HTTP.Types (status200, status404)
+import Network.HTTP.Types (parseQuery, status200, status400, status404)
 import Network.Wai
   ( Application,
     Response,
     pathInfo,
-    responseFile,
+    rawQueryString,
     responseLBS,
   )
 import Network.Wai.Handler.Warp (run)
@@ -53,11 +55,16 @@ import Network.WebSockets
 import Options.Applicative
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.Environment (getEnv, lookupEnv)
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO (hFlush, stdout)
 import System.Posix.Signals (nullSignal, signalProcess)
+import System.Process (createProcess, proc)
 import System.Posix.Types (CPid (..))
 import Prelude
+
+-- | Deck HTML embedded at compile time so the binary is self-contained.
+deckHtml :: LBS.ByteString
+deckHtml = LBS.fromStrict $(embedFile "app/deck.html")
 
 data Opts = Opts
   { optName :: String,
@@ -66,7 +73,6 @@ data Opts = Opts
     optHost :: String,
     optPort :: Int,
     optHistory :: Int,
-    optHtml :: FilePath,
     optBoard :: FilePath
   }
 
@@ -79,7 +85,6 @@ optsP =
     <*> strOption (long "host" <> value "127.0.0.1" <> showDefault)
     <*> option auto (long "port" <> short 'p' <> value 9162 <> showDefault)
     <*> option auto (long "history" <> value 80 <> showDefault <> help "Log lines on WS connect")
-    <*> strOption (long "html" <> value "app/deck.html" <> showDefault)
     <*> strOption (long "board" <> value "" <> help "Default: $HOME/mg/loom/board.md")
 
 main :: IO ()
@@ -116,7 +121,8 @@ main = do
     busFan <- newBroadcastTChanIO
     void $ async $ busPump ch busFan
     let wsApp = clientApp ch name busFan logf (optHistory o)
-        httpApp = staticApp (optHtml o) boardPath agentsDir logf
+        chan = T.pack (optChannel o)
+        httpApp = staticApp boardPath agentsDir logf chan name
         app = websocketsOr defaultConnectionOptions wsApp httpApp
     run (optPort o) app
 
@@ -144,12 +150,12 @@ busPump ch fan = forever $ do
     msgs
   when (null msgs) $ threadDelay 50_000
 
-staticApp :: FilePath -> FilePath -> FilePath -> FilePath -> Application
-staticApp htmlPath boardPath agentsDir logf req respond =
+staticApp :: FilePath -> FilePath -> FilePath -> Text -> Text -> Application
+staticApp boardPath agentsDir logf channel identity req respond =
   case pathInfo req of
-    [] -> serveHtml htmlPath respond
+    [] -> serveHtml respond
     ["api", "state"] -> do
-      body <- buildStateJson boardPath agentsDir logf
+      body <- buildStateJson boardPath agentsDir logf channel identity
       respond $
         responseLBS
           status200
@@ -164,47 +170,119 @@ staticApp htmlPath boardPath agentsDir logf req respond =
           status200
           [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")]
           (LBS.fromStrict (encodeUtf8 t))
+    ["api", "open"] -> do
+      let loomDir = takeDirectory boardPath
+          qs = parseQuery (rawQueryString req)
+          mpath = case lookup "path" qs of
+            Just (Just p) -> Just (loomDir </> T.unpack (decodeUtf8 p))
+            _ -> Nothing
+      case mpath of
+        Just fullPath -> do
+          void $ try @IOException $ createProcess (proc "open" [fullPath])
+          respond $ responseLBS status200 [("Content-Type", "text/plain")] "ok"
+        Nothing ->
+          respond $ responseLBS status400 [("Content-Type", "text/plain")] "missing path"
     _ ->
       respond $
         responseLBS status404 [("Content-Type", "text/plain")] "not found"
 
-serveHtml :: FilePath -> (Response -> IO a) -> IO a
-serveHtml htmlPath respond = do
-  exists <- doesFileExist htmlPath
-  if exists
-    then
-      respond $
-        responseFile
-          status200
-          [("Content-Type", "text/html; charset=utf-8")]
-          htmlPath
-          Nothing
-    else
-      respond $
-        responseLBS status404 [("Content-Type", "text/plain")] "deck.html not found"
+serveHtml :: (Response -> IO a) -> IO a
+serveHtml respond =
+  respond $
+    responseLBS
+      status200
+      [("Content-Type", "text/html; charset=utf-8")]
+      deckHtml
 
-buildStateJson :: FilePath -> FilePath -> FilePath -> IO Text
-buildStateJson boardPath agentsDir logf = do
+buildStateJson :: FilePath -> FilePath -> FilePath -> Text -> Text -> IO Text
+buildStateJson boardPath agentsDir logf channel identity = do
   board <- readFileUtf8 boardPath
   agents <- listAgents agentsDir
-  lastBy <- lastLinesBySender logf 400
-  let agentRows =
-        [ agentJson a (Map.lookup (agName a) lastBy)
-          | a <- agents
-        ]
+  lastBy <- lastLinesBySender logf 30  -- recent posters only
+  msession <- readSessionInfo (takeDirectory logf)
+  let hermesRow = agentJson (AgentInfo "hermes" "active" Nothing "") (Map.lookup "hermes" lastBy)
+      allAgentRows = hermesRow : [ agentJson a (Map.lookup (agName a) lastBy) | a <- agents, agStatus a /= "down" ]
       projects = projectLines board
+      -- bus participants: names that posted in the recent log tail
+      busNames = Map.keys lastBy
+      sessionJson = case msession of
+        Nothing -> "null"
+        Just s ->
+          T.concat
+            [ "{\"status\":"
+            , jsonStr (siStatus s)
+            , ",\"opened\":"
+            , jsonStr (siOpened s)
+            , ",\"participants\":["
+            , T.intercalate "," (map jsonStr (siParticipants s))
+            , "],\"logStart\":"
+            , T.pack (show (siLogStart s))
+            , "}"
+            ]
   pure $
     T.concat
-      [ "{\"boardPath\":",
+      [ "{\"channel\":",
+        jsonStr channel,
+        ",\"identity\":",
+        jsonStr identity,
+        ",\"boardPath\":",
         jsonStr (T.pack boardPath),
         ",\"board\":",
         jsonStr board,
         ",\"projects\":[",
         T.intercalate "," (map jsonStr projects),
         "],\"agents\":[",
-        T.intercalate "," agentRows,
-        "]}"
+        T.intercalate "," allAgentRows,
+        "],\"bus\":[",
+        T.intercalate "," (map jsonStr busNames),
+        "],\"session\":",
+        sessionJson,
+        "}" 
       ]
+
+data SessionInfo = SessionInfo
+  { siStatus :: Text,
+    siOpened :: Text,
+    siParticipants :: [Text],
+    siLogStart :: Int
+  }
+
+readSessionInfo :: FilePath -> IO (Maybe SessionInfo)
+readSessionInfo dir = do
+  let path = dir </> "session.md"
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      raw <- TIO.readFile path
+      let kv = map (T.breakOn ":") (T.lines raw)
+          lookupKey k =
+            listToMaybe
+              [ T.strip (T.drop 1 v)
+                | (k', v) <- kv,
+                  T.strip k' == k
+              ]
+          participants =
+            maybe
+              []
+              (filter (not . T.null) . map T.strip . T.words)
+              (lookupKey "participants")
+          logStart =
+            maybe
+              0
+              (\v -> case reads (T.unpack (T.strip v)) of [(n, _)] -> n; _ -> 0)
+              (lookupKey "log-start")
+      case lookupKey "status" of
+        Nothing -> pure Nothing
+        Just st ->
+          pure $
+            Just
+              SessionInfo
+                { siStatus = st,
+                  siOpened = fromMaybe "" (lookupKey "opened"),
+                  siParticipants = participants,
+                  siLogStart = logStart
+                }
 
 data AgentInfo = AgentInfo
   { agName :: Text,
@@ -307,10 +385,7 @@ projectLines board =
   [ T.strip l
     | l <- T.lines board,
       let s = T.strip l,
-      T.isPrefixOf "🟣" s
-        || T.isPrefixOf "🟢" s
-        || T.isPrefixOf "🟡" s
-        || T.isPrefixOf "🔵" s
+      T.isInfixOf "bus-deck" s
   ]
 
 agentJson :: AgentInfo -> Maybe Text -> Text

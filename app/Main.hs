@@ -15,11 +15,12 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, try)
 import Control.Monad (unless, void, when)
 import Data.Char (isSpace)
-import Data.List (intercalate, isPrefixOf, sort)
-import Data.Maybe (fromMaybe)
+import Data.List (dropWhileEnd, intercalate, isPrefixOf, sort)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Mailbox qualified as MB
 import Options.Applicative
 import System.Directory
@@ -105,6 +106,65 @@ watchCursorFile dir name = dir </> ".watch-" <> name
 logFile :: FilePath -> FilePath
 logFile dir = dir </> "log.md"
 
+-- | Session metadata file inside a channel directory.
+sessionFile :: FilePath -> FilePath
+sessionFile dir = dir </> "session.md"
+
+-- | Session state persisted to @session.md@.
+data SessionState = SessionState
+  { sessStatus :: String,
+    sessOpened :: String,
+    sessParticipants :: [String],
+    sessLogStart :: Int
+  }
+  deriving (Show)
+
+-- | Render session state as simple key-value text.
+writeSession :: FilePath -> SessionState -> IO ()
+writeSession path s =
+  writeFile path $
+    unlines
+      [ "status: " <> sessStatus s,
+        "opened: " <> sessOpened s,
+        "participants: " <> unwords (sessParticipants s),
+        "log-start: " <> show (sessLogStart s)
+      ]
+
+-- | Parse session state from key-value text.
+readSession :: FilePath -> IO (Maybe SessionState)
+readSession path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      raw <- lines . T.unpack <$> TIO.readFile path
+      let kv = map (break (== ':')) raw
+          lookupKey k =
+            listToMaybe
+              [ trim (drop 1 v)
+                | (k', v) <- kv,
+                  trim k' == k
+              ]
+          participants = maybe [] words (lookupKey "participants")
+          logStart = maybe 0 (\v -> fromMaybe 0 (readMaybe (trim v))) (lookupKey "log-start")
+      case lookupKey "status" of
+        Nothing -> pure Nothing
+        Just st ->
+          pure $
+            Just
+              SessionState
+                { sessStatus = st,
+                  sessOpened = fromMaybe "" (lookupKey "opened"),
+                  sessParticipants = participants,
+                  sessLogStart = logStart
+                }
+  where
+    trim = dropWhileEnd isSpace . dropWhile isSpace
+
+-- | Current UTC timestamp in ISO-8601 format.
+nowIso :: IO String
+nowIso = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S" <$> getCurrentTime
+
 -- ---------------------------------------------------------------------------
 -- Commands
 -- ---------------------------------------------------------------------------
@@ -117,6 +177,19 @@ data AgentCmd
   | AgentStatus (Maybe String)
   | AgentList
   deriving (Show)
+
+data SessionCmd
+  = SessionOpen
+  | SessionClose
+  | SessionStatus
+  | SessionList
+  deriving (Show, Eq)
+
+data DeskCmd
+  = DeskStart String Int
+  | DeskStop
+  | DeskStatus
+  deriving (Show, Eq)
 
 data Cmd
   = CmdBus BusCmd
@@ -131,6 +204,8 @@ data Cmd
   | CmdClean String Bool
   | CmdPrune String Int Bool
   | CmdAgent AgentCmd
+  | CmdSession SessionCmd
+  | CmdDesk DeskCmd
   deriving (Show)
 
 nameArg :: Parser String
@@ -229,6 +304,18 @@ cmdParser =
               (CmdAgent <$> agentCmdParser)
               (progDesc "Agent lifecycle (muster-agent)")
           )
+        <> command
+          "session"
+          ( info
+              (CmdSession <$> sessionCmdParser)
+              (progDesc "Session lifecycle (open/close/status/list)")
+          )
+        <> command
+          "desk"
+          ( info
+              (CmdDesk <$> deskCmdParser)
+              (progDesc "Desk web UI lifecycle")
+          )
     )
 
 busCmdParser :: Parser BusCmd
@@ -292,6 +379,49 @@ agentCmdParser =
           )
     )
 
+sessionCmdParser :: Parser SessionCmd
+sessionCmdParser =
+  hsubparser
+    ( command "open" (info (pure SessionOpen) (progDesc "Open a session on the current channel"))
+        <> command "close" (info (pure SessionClose) (progDesc "Close the session and archive its log"))
+        <> command "status" (info (pure SessionStatus) (progDesc "Show current channel session"))
+        <> command "list" (info (pure SessionList) (progDesc "List all open sessions"))
+    )
+
+deskNameOpt :: Parser String
+deskNameOpt =
+  strOption
+    ( long "name"
+        <> short 'n'
+        <> value "desk"
+        <> showDefault
+        <> help "Desk identity on the bus"
+    )
+
+deskPortOpt :: Parser Int
+deskPortOpt =
+  option
+    auto
+    ( long "port"
+        <> short 'p'
+        <> value 9162
+        <> showDefault
+        <> help "HTTP port"
+    )
+
+deskCmdParser :: Parser DeskCmd
+deskCmdParser =
+  hsubparser
+    ( command
+        "start"
+        ( info
+            (DeskStart <$> deskNameOpt <*> deskPortOpt)
+            (progDesc "Start the web desk")
+        )
+        <> command "stop" (info (pure DeskStop) (progDesc "Stop the web desk"))
+        <> command "status" (info (pure DeskStatus) (progDesc "Report desk health"))
+    )
+
 data Options = Options Global Cmd
 
 optionsParser :: ParserInfo Options
@@ -329,6 +459,13 @@ runJoin opts name = do
       total <- countLogLines dir
       writeFile cursor (show total <> "\n")
       putStrLn $ "[" <> name <> "] joined " <> globalChannel opts <> "; cursor at line " <> show total
+  -- If a session is open on this channel, add the participant.
+  ms <- readSession (sessionFile dir)
+  case ms of
+    Just s | sessStatus s == "open" && name `notElem` sessParticipants s -> do
+      let s' = s {sessParticipants = sort (name : sessParticipants s)}
+      writeSession (sessionFile dir) s'
+    _ -> pure ()
 
 runLeave :: Global -> String -> IO ()
 runLeave opts name = do
@@ -714,6 +851,100 @@ runChannels opts = do
     padR :: Int -> String -> String
     padR n s = s <> replicate (max 0 (n - length s)) ' '
 
+-- | Session lifecycle on a channel.
+runSession :: Global -> SessionCmd -> IO ()
+runSession opts = \case
+  SessionOpen -> runSessionOpen opts
+  SessionClose -> runSessionClose opts
+  SessionStatus -> runSessionStatus opts
+  SessionList -> runSessionList opts
+
+runSessionOpen :: Global -> IO ()
+runSessionOpen opts = do
+  dir <- channelDir opts
+  createDirectoryIfMissing True dir
+  root <- busRoot opts
+  MB.busStart dir (globalChannel opts) root
+  ms <- readSession (sessionFile dir)
+  case ms of
+    Just s | sessStatus s == "open" ->
+      putStrLn $ "session already open on " <> globalChannel opts <> " (since " <> sessOpened s <> ")"
+    _ -> do
+      n <- countLogLines dir
+      t <- nowIso
+      let s = SessionState {sessStatus = "open", sessOpened = t, sessParticipants = [], sessLogStart = n}
+      writeSession (sessionFile dir) s
+      putStrLn $ "session opened on " <> globalChannel opts <> " at line " <> show n
+
+runSessionClose :: Global -> IO ()
+runSessionClose opts = do
+  dir <- channelDir opts
+  ms <- readSession (sessionFile dir)
+  case ms of
+    Nothing -> putStrLn $ "no session on " <> globalChannel opts
+    Just s | sessStatus s /= "open" ->
+      putStrLn $ "session on " <> globalChannel opts <> " is not open"
+    Just s -> do
+      let logPath = logFile dir
+          archivePath = dir </> "log-archive.md"
+      hasLog <- doesFileExist logPath
+      when hasLog do
+        raw <- TIO.readFile logPath
+        let ls = T.lines raw
+            start = sessLogStart s
+            (kept, dropped) = splitAt start ls
+        -- Archive lines from log-start to end.
+        unless (null dropped) do
+          let archiveHeader = T.pack $ "\n--- session close " <> globalChannel opts <> " opened=" <> sessOpened s <> " ---\n"
+          TIO.appendFile archivePath (archiveHeader <> T.unlines dropped)
+        -- Retain only lines before log-start.
+        TIO.writeFile logPath (if null kept then "" else T.unlines kept)
+        -- Reset cursors to new tail.
+        entries <- listDirectory dir
+        let cursors = [e | e <- entries, ".cursor-" `isPrefixOf` e || ".watch-" `isPrefixOf` e]
+            newPos = length kept
+        mapM_ (\e -> writeFile (dir </> e) (show newPos <> "\n")) cursors
+      t <- nowIso
+      let s' = s {sessStatus = "closed", sessOpened = sessOpened s <> "; closed: " <> t}
+      writeSession (sessionFile dir) s'
+      MB.busStop dir
+      putStrLn $ "session closed on " <> globalChannel opts
+
+runSessionStatus :: Global -> IO ()
+runSessionStatus opts = do
+  dir <- channelDir opts
+  ms <- readSession (sessionFile dir)
+  case ms of
+    Nothing -> putStrLn $ "no session on " <> globalChannel opts
+    Just s -> do
+      putStrLn $ "session on " <> globalChannel opts
+      putStrLn $ "  status:       " <> sessStatus s
+      putStrLn $ "  opened:       " <> sessOpened s
+      putStrLn $ "  participants: " <> unwords (sessParticipants s)
+      putStrLn $ "  log-start:    " <> show (sessLogStart s)
+
+runSessionList :: Global -> IO ()
+runSessionList opts = do
+  root <- busRoot opts
+  exists <- doesDirectoryExist root
+  unless exists do
+    hPutStrLn stderr $ "muster: no bus root at " <> root
+    exitWith (ExitFailure 1)
+  entries <- listDirectory root
+  let dirs = sort entries
+  rows <- concat <$> mapM (\n -> sessionRow (root </> n) n) dirs
+  if null rows
+    then putStrLn "no open sessions"
+    else mapM_ putStrLn rows
+  where
+    sessionRow :: FilePath -> String -> IO [String]
+    sessionRow dir name = do
+      ms <- readSession (sessionFile dir)
+      case ms of
+        Just s | sessStatus s == "open" ->
+          pure [name <> "  open  " <> sessOpened s <> "  [" <> unwords (sessParticipants s) <> "]"]
+        _ -> pure []
+
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
@@ -917,6 +1148,97 @@ runAgent opts = \case
   AgentStatus (Just name) -> runAgentStatusOne opts name
   AgentList -> runAgentList opts
 
+-- | Desk pid file inside a channel directory.
+deskPidFile :: FilePath -> FilePath
+deskPidFile dir = dir </> "desk.pid"
+
+runDesk :: Global -> DeskCmd -> IO ()
+runDesk opts = \case
+  DeskStart name port -> runDeskStart opts name port
+  DeskStop -> runDeskStop opts
+  DeskStatus -> runDeskStatus opts
+
+runDeskStart :: Global -> String -> Int -> IO ()
+runDeskStart opts name port = do
+  dir <- channelDir opts
+  createDirectoryIfMissing True dir
+  let pidPath = deskPidFile dir
+      logPath = dir </> "desk.log"
+  mpid <- readPidInt pidPath
+  case mpid of
+    Just p -> do
+      alive <- pidAlive p
+      when alive do
+        hPutStrLn stderr $ "muster: desk already running (pid " <> show p <> ")"
+        exitWith (ExitFailure 1)
+    Nothing -> pure ()
+  let args =
+        [ "--name", name,
+          "--channel", globalChannel opts,
+          "--port", show port
+        ]
+      rootArg = case globalBusRoot opts of
+        "" -> []
+        r -> ["--bus-root", r]
+      allArgs = args <> rootArg
+      sh =
+        "nohup muster-ws "
+          <> unwords allArgs
+          <> " >> "
+          <> show logPath
+          <> " 2>&1 & echo $! > "
+          <> show pidPath
+  (_, _, _, ph) <-
+    createProcess
+      (proc "/bin/sh" ["-c", sh]) {std_in = NoStream}
+  void $ waitForProcess ph
+  threadDelay 500000
+  mpid' <- readPidInt pidPath
+  case mpid' of
+    Nothing -> do
+      hPutStrLn stderr $ "muster: desk pid not written — see " <> logPath
+      exitWith (ExitFailure 1)
+    Just p -> do
+      alive <- pidAlive p
+      if alive
+        then putStrLn $ "desk started on http://127.0.0.1:" <> show port <> " (pid " <> show p <> ")"
+        else do
+          hPutStrLn stderr $ "muster: desk died immediately — see " <> logPath
+          exitWith (ExitFailure 1)
+
+runDeskStop :: Global -> IO ()
+runDeskStop opts = do
+  dir <- channelDir opts
+  let pidPath = deskPidFile dir
+  mpid <- readPidInt pidPath
+  case mpid of
+    Nothing -> putStrLn $ "no desk running on " <> globalChannel opts
+    Just p -> do
+      alive <- pidAlive p
+      if alive
+        then do
+          killPid p
+          removeFile pidPath
+          putStrLn $ "desk stopped (was pid " <> show p <> ")"
+        else do
+          removeFile pidPath
+          putStrLn $ "desk stale pid " <> show p <> " removed"
+
+runDeskStatus :: Global -> IO ()
+runDeskStatus opts = do
+  dir <- channelDir opts
+  let pidPath = deskPidFile dir
+  mpid <- readPidInt pidPath
+  case mpid of
+    Nothing -> putStrLn $ "no desk on " <> globalChannel opts
+    Just p -> do
+      alive <- pidAlive p
+      if alive
+        then putStrLn $ "desk alive on " <> globalChannel opts <> " (pid " <> show p <> ")"
+        else do
+          removeFile pidPath
+          putStrLn $ "desk stale pid " <> show p <> " removed"
+
 main :: IO ()
 main = do
   Options opts cmd <- execParser optionsParser
@@ -933,3 +1255,5 @@ main = do
     CmdClean channel yes -> runClean opts channel yes
     CmdPrune channel keep yes -> runPrune opts channel keep yes
     CmdAgent ac -> runAgent opts ac
+    CmdSession sc -> runSession opts sc
+    CmdDesk dc -> runDesk opts dc

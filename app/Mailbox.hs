@@ -58,12 +58,6 @@ import System.IO
     utf8,
   )
 import System.Posix.Files (createNamedPipe, stdFileMode)
-import System.Posix.IO
-  ( OpenMode (..),
-    defaultFileFlags,
-    fdToHandle,
-    openFd,
-  )
 import System.Posix.Process (getProcessID)
 import System.Posix.Types (CPid (..), ProcessID)
 import System.Process
@@ -201,8 +195,8 @@ busDaemon dir = do
   createDirectoryIfMissing True dir
   -- Open FIFO read-write: keeps a write-end open so readers never see EOF
   -- between messages (posix @open(O_RDWR)@ ≡ bash @cat \<>fifo@).
-  fd <- openFd (mbFifo p) ReadWrite defaultFileFlags
-  h <- fdToHandle fd
+  -- Using openFile (not fdToHandle) so hSetEncoding is respected.
+  h <- openFile (mbFifo p) ReadWriteMode
   hSetEncoding h utf8
   hSetBuffering h LineBuffering
   logH <- openFile (mbLog p) AppendMode

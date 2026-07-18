@@ -52,7 +52,7 @@ build-type:         Simple
 extra-doc-files:    CHANGELOG.md
 
 -- Extra source files to be distributed with the package, such as examples, or a tutorial module.
--- extra-source-files:
+extra-source-files: app/deck.html
 
 common warnings
     ghc-options: -Wall
@@ -76,6 +76,7 @@ executable muster
         circuits-repl,
         optparse-applicative,
         text,
+        time,
         directory,
         filepath,
         process,
@@ -119,8 +120,10 @@ executable muster-ws
         circuits-io,
         circuits-repl,
         containers,
+        file-embed,
         http-types,
         optparse-applicative,
+        process,
         stm,
         text,
         directory,
@@ -130,6 +133,22 @@ executable muster-ws
         wai-websockets,
         warp,
         websockets
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
+executable muster-alert
+    import:           warnings
+
+    main-is:          MusterAlert.hs
+
+    build-depends:
+        base,
+        directory,
+        filepath,
+        process,
+        unix
 
     hs-source-dirs:   app
 
