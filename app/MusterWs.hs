@@ -12,15 +12,16 @@
 -- @
 module Main where
 
-import Circuit.Comm
+import Muster.Channel
   ( Channel,
     ChannelConfig (..),
     channelAttach,
     channelClose,
     channelRecv,
     channelSend,
-    frameMessage,
+    defaultChannelConfig,
   )
+import Muster.Framing (frameMessage)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitEither)
 import Control.Concurrent.STM
@@ -103,12 +104,9 @@ main = do
 
   let name = T.pack (optName o)
       cfg =
-        ChannelConfig
-          { chStdinPath = fifo,
-            chStdoutPath = logf,
-            chStderrPath = dir </> "err.md",
-            chName = name,
-            chWorkingDir = dir
+        (defaultChannelConfig name)
+          { chChannel = optChannel o,
+            chBusRoot = optBusRoot o
           }
 
   putStrLn $ "muster-ws: attaching as " <> optName o <> " on " <> optChannel o

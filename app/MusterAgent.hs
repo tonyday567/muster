@@ -4,83 +4,62 @@
 
 -- | Long-lived agent process that participates on a muster bus channel.
 --
--- Reads addressed messages from the bus, dispatches them to an external
--- agent command (default: @hermes@), and posts the replies back.
+-- Reads addressed messages from the bus and dispatches them to an external
+-- process. Two modes:
+--
+--   * __oneshot__: runs @\<agent\> chat -q \<prompt\>@ for each addressed message.
+--   * __persistent__: keeps a single repl process alive (e.g. @cabal repl@).
 --
 -- Usage:
 --
 -- @
 --   muster-agent --name deep --agent hermes
+--   muster-agent --name cabal --agent cabal --mode persistent --project ~/haskell/circuits -c dev
 -- @
---
--- The agent command is invoked as @\<agent\> chat -q \<prompt\>@. Set
--- @--agent@ to any CLI tool that accepts @-q@ for single-prompt mode and
--- @--continue@ for session resumption (optional — falls back to fresh
--- sessions on failure).
-module Main (main, MusterAgentConfig (..), defaultMusterAgentConfig) where
+module Main (main) where
 
-import Circuit.Comm (ChannelConfig (..), attachMusterRepl)
-import Circuit.Repl (Repl, replCommit, replEmit)
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
 import Control.Monad (forever, unless, when)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Muster.Agent (AgentConfig (..), AgentMode (..), addressedTo, agentQuery, defaultAgentConfig, stripAddress)
+import Muster.Channel (Channel, ChannelConfig (..), channelAttach, channelRecv, channelSend, defaultChannelConfig)
+import Muster.Connector (ConnectorConfig (..), defaultConnectorConfig, runConnector)
 import Options.Applicative
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, getHomeDirectory)
 import System.Environment (getEnv, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO (stderr)
-import System.Process (readCreateProcessWithExitCode, shell)
 import Prelude
 
 -- ---------------------------------------------------------------------------
 -- Config
 -- ---------------------------------------------------------------------------
 
--- | Agent configuration. Everything the agent needs to join a channel and
--- dispatch messages.
 data MusterAgentConfig = MusterAgentConfig
-  { cfgName :: String
-  -- ^ Agent name on the muster bus.
-  , cfgModel :: Maybe String
-  -- ^ Model override (passed as @-m@ to the agent command).
-  , cfgProvider :: Maybe String
-  -- ^ Provider override (passed as @--provider@ to the agent command).
-  , cfgAgent :: String
-  -- ^ Agent CLI command (default: @\"hermes\"@). Invoked as @<agent> chat -q
-  -- <prompt>@.
-  , cfgBusRoot :: FilePath
-  -- ^ Root directory for all bus state (default: @$HOME\/mg\/logs\/muster@).
-  , cfgChannel :: String
-  -- ^ Channel name (default: @\"general\"@).
-  , cfgFifo :: FilePath
-  -- ^ FIFO path inside the channel directory (default: @bus.fifo@).
-  , cfgLog :: FilePath
-  -- ^ Log file path inside the channel directory (default: @log.md@).
+  { maName :: String,
+    maModel :: Maybe String,
+    maProvider :: Maybe String,
+    maAgent :: String,
+    maMode :: AgentMode,
+    maProject :: Maybe FilePath,
+    maBusRoot :: FilePath,
+    maChannel :: String
   }
   deriving (Show)
 
--- | Sensible defaults for a muster agent on the local machine.
-defaultMusterAgentConfig :: MusterAgentConfig
-defaultMusterAgentConfig =
-  MusterAgentConfig
-    { cfgName = "agent"
-    , cfgModel = Nothing
-    , cfgProvider = Nothing
-    , cfgAgent = "hermes"
-    , cfgBusRoot = ""
-    , cfgChannel = "general"
-    , cfgFifo = "bus.fifo"
-    , cfgLog = "log.md"
-    }
+-- ---------------------------------------------------------------------------
+-- CLI
+-- ---------------------------------------------------------------------------
 
--- ---------------------------------------------------------------------------
--- CLI (optparse-applicative)
--- ---------------------------------------------------------------------------
+modeReader :: ReadM AgentMode
+modeReader = eitherReader $ \case
+  "oneshot" -> Right OneShot
+  "persistent" -> Right Persistent
+  s -> Left $ "unknown mode: " <> s <> " (expected oneshot or persistent)"
 
 configParser :: Parser MusterAgentConfig
 configParser =
@@ -111,7 +90,22 @@ configParser =
           <> value "hermes"
           <> showDefault
           <> metavar "CMD"
-          <> help "Agent CLI command (invoked as <cmd> chat -q <prompt>)"
+          <> help "Agent CLI command (oneshot: <cmd> chat -q; persistent: <cmd> repl)"
+      )
+    <*> option
+      modeReader
+      ( long "mode"
+          <> value OneShot
+          <> showDefault
+          <> metavar "MODE"
+          <> help "Agent mode: oneshot | persistent"
+      )
+    <*> optional
+      ( strOption
+          ( long "project"
+              <> metavar "DIR"
+              <> help "Project directory for persistent repl (default: ~/haskell/circuits)"
+          )
       )
     <*> strOption
       ( long "bus-root"
@@ -127,20 +121,6 @@ configParser =
           <> showDefault
           <> metavar "CHANNEL"
           <> help "Muster channel"
-      )
-    <*> strOption
-      ( long "fifo"
-          <> value "bus.fifo"
-          <> showDefault
-          <> metavar "PATH"
-          <> help "FIFO path inside the channel directory"
-      )
-    <*> strOption
-      ( long "log"
-          <> value "log.md"
-          <> showDefault
-          <> metavar "PATH"
-          <> help "Log file path inside the channel directory"
       )
 
 optsInfo :: ParserInfo MusterAgentConfig
@@ -158,7 +138,7 @@ optsInfo =
 
 busRoot :: MusterAgentConfig -> IO FilePath
 busRoot cfg = do
-  let explicit = cfgBusRoot cfg
+  let explicit = maBusRoot cfg
   if not (null explicit)
     then pure explicit
     else do
@@ -170,159 +150,86 @@ busRoot cfg = do
 channelDir :: MusterAgentConfig -> IO FilePath
 channelDir cfg = do
   root <- busRoot cfg
-  pure (root </> cfgChannel cfg)
+  pure (root </> maChannel cfg)
 
-toChannelConfig :: MusterAgentConfig -> FilePath -> ChannelConfig
-toChannelConfig cfg dir =
-  ChannelConfig
-    { chStdinPath = dir </> cfgFifo cfg
-    , chStdoutPath = dir </> cfgLog cfg
-    , chStderrPath = dir </> "err.md"
-    , chName = T.pack (cfgName cfg)
-    , chWorkingDir = dir
+toChannelConfig :: MusterAgentConfig -> ChannelConfig
+toChannelConfig cfg =
+  (defaultChannelConfig (T.pack (maName cfg)))
+    { chChannel = maChannel cfg,
+      chBusRoot = maBusRoot cfg
     }
 
--- ---------------------------------------------------------------------------
--- Agent invocation
--- ---------------------------------------------------------------------------
+toAgentConfig :: MusterAgentConfig -> AgentConfig
+toAgentConfig cfg =
+  defaultAgentConfig
+    { cfgName = maName cfg,
+      cfgAgent = maAgent cfg,
+      cfgModel = maModel cfg,
+      cfgProvider = maProvider cfg
+    }
 
--- | Query the external agent process. Runs @\<agent\> chat -q \<prompt\>@,
--- attempting session continuation first, falling back to a fresh session.
-agentQuery :: MusterAgentConfig -> Text -> IO Text
-agentQuery cfg prompt = do
-  homeModel <- lookupEnv "HERMES_MODEL"
-  homeProv <- lookupEnv "HERMES_PROVIDER"
-  let model = fromMaybe (fromMaybe "deepseek-v4-pro" homeModel) (cfgModel cfg)
-      provider = fromMaybe (fromMaybe "deepseek" homeProv) (cfgProvider cfg)
-      session = cfgName cfg <> "-session"
-      q = shellQuote (T.unpack prompt)
-      baseArgs =
-        [ cfgAgent cfg <> " chat -q"
-        , q
-        , "-m", shellQuote model
-        , "--provider", shellQuote provider
-        , "--yolo -Q --max-turns 90"
-        ]
-      continueArgs = baseArgs <> ["--continue", shellQuote session]
-      run args = do
-        let cmd = unwords ("export PATH=\"$HOME/.local/bin:$PATH\";" : args)
-        (code, out, err) <- readCreateProcessWithExitCode (shell cmd) ""
-        pure (code, T.pack out <> T.pack err)
-  (code1, out1) <- run continueArgs
-  let missing =
-        "No session found matching" `T.isInfixOf` out1
-          || code1 /= ExitSuccess
-  if missing
-    then do
-      logErr $ "  continue failed (code " <> show code1 <> ") — fresh session: " <> session
-      (code2, out2) <- run baseArgs
-      when (code2 /= ExitSuccess) $
-        logErr $ "  fresh agent also failed (code " <> show code2 <> "): " <> T.unpack (T.take 200 out2)
-      pure $ cleanAgentOut out2
-    else pure $ cleanAgentOut out1
-
-shellQuote :: String -> String
-shellQuote s = "'" <> concatMap esc s <> "'"
-  where
-    esc '\'' = "'\\''"
-    esc c = [c]
-
-cleanAgentOut :: Text -> Text
-cleanAgentOut =
-  T.unlines
-    . filter keep
-    . map T.strip
-    . T.lines
-  where
-    keep l
-      | T.null l = False
-      | "session_id:" `T.isPrefixOf` l = False
-      | "Warning:" `T.isPrefixOf` l = False
-      | "Resumed session" `T.isInfixOf` l = False
-      | "Reached maximum" `T.isInfixOf` l = False
-      | "Requesting summary" `T.isInfixOf` l = False
-      | "No session found matching" `T.isInfixOf` l = False
-      | "Use 'hermes sessions list'" `T.isInfixOf` l = False
-      | otherwise = True
+projectDir :: MusterAgentConfig -> IO FilePath
+projectDir cfg = case maProject cfg of
+  Just d -> pure d
+  Nothing -> (</> "haskell" </> "circuits") <$> getHomeDirectory
 
 -- ---------------------------------------------------------------------------
--- Address matching
--- ---------------------------------------------------------------------------
-
-addressedTo :: Text -> Text -> Bool
-addressedTo name body =
-  let low = T.toLower body
-      n = T.toLower name
-   in T.isPrefixOf (n <> ":") low
-        || (" " <> n <> ":") `T.isInfixOf` low
-        || T.isPrefixOf ("@" <> n) low
-        || (" @" <> n) `T.isInfixOf` low
-
-stripAddress :: Text -> Text -> Text
-stripAddress name body =
-  let n = T.toLower name
-      low = T.toLower body
-      stripAt i = T.strip $ T.dropWhile (== ' ') $ T.drop i body
-      tryPrefix prefix =
-        let p = prefix <> ":"
-         in case T.breakOn p low of
-              (_, r) | not (T.null r) ->
-                let i = T.length body - T.length r + T.length p
-                 in Just (stripAt i)
-              _ -> Nothing
-      tryAt =
-        let at = "@" <> n
-         in case T.breakOn at low of
-              (_, r) | not (T.null r) ->
-                let i = T.length body - T.length r + T.length at
-                 in Just (T.strip $ T.drop i body)
-              _ -> Nothing
-   in case tryPrefix n of
-        Just rest -> rest
-        Nothing -> case tryAt of
-          Just rest -> rest
-          Nothing -> T.strip body
-
--- ---------------------------------------------------------------------------
--- Main loop
+-- Main
 -- ---------------------------------------------------------------------------
 
 main :: IO ()
 main = do
   cfg <- execParser optsInfo
   dir <- channelDir cfg
-  let chanCfg = toChannelConfig cfg dir
 
-  logErr $ "muster-agent [" <> cfgName cfg <> "] starting on " <> dir
-  logErr $ "  agent command: " <> cfgAgent cfg
+  logErr $ "muster-agent [" <> maName cfg <> "] starting on " <> dir
+  logErr $ "  mode: " <> show (maMode cfg)
+  logErr $ "  agent command: " <> maAgent cfg
 
-  fifoExists <- doesFileExist (chStdinPath chanCfg)
+  fifoExists <- doesFileExist (dir </> "bus.fifo")
   unless fifoExists do
     logErr "bus.fifo not found — run 'muster bus start' first"
     exitWith (ExitFailure 1)
 
-  repl <- attachMusterRepl chanCfg
+  case maMode cfg of
+    OneShot -> runOneShot cfg
+    Persistent -> runPersistent cfg
+
+runOneShot :: MusterAgentConfig -> IO ()
+runOneShot cfg = do
+  let chanCfg = toChannelConfig cfg
+      agentCfg = toAgentConfig cfg
+  ch <- channelAttach chanCfg
   logErr "attached to bus; waiting for addressed messages"
-
-  -- Drain backlog so we only react to new traffic.
-  _ <- replEmit repl
-
+  _ <- channelRecv ch -- drain backlog
   forever do
     msgs <-
-      try @SomeException (replEmit repl) >>= \case
+      try @SomeException (channelRecv ch) >>= \case
         Left err -> do
           logErr $ "recv error: " <> show err
           pure []
         Right ms -> pure ms
-
     if null msgs
       then threadDelay 500_000
-      else mapM_ (handleMessage cfg repl) msgs
+      else mapM_ (handleMessage agentCfg ch) msgs
 
-handleMessage :: MusterAgentConfig -> Repl -> Text -> IO ()
-handleMessage cfg repl body = do
+runPersistent :: MusterAgentConfig -> IO ()
+runPersistent cfg = do
+  project <- projectDir cfg
+  let connCfg =
+        (defaultConnectorConfig (T.pack (maName cfg)))
+          { connChannel = maChannel cfg,
+            connBusRoot = maBusRoot cfg,
+            connProject = project,
+            connCommand = maAgent cfg,
+            connArgs = ["repl"]
+          }
+  runConnector connCfg
+
+handleMessage :: AgentConfig -> Channel -> (Text, Text) -> IO ()
+handleMessage cfg ch (sender, body) = do
   let name = T.pack (cfgName cfg)
-  when (addressedTo name body) do
+  when (sender /= name && addressedTo name body) do
     let task = stripAddress name body
     logErr $ "  task: " <> T.unpack (T.take 100 task)
     er <- try @SomeException (agentQuery cfg task)
@@ -333,9 +240,12 @@ handleMessage cfg repl body = do
         if null lines'
           then logErr "  (empty agent reply)"
           else
-            mapM_ (\line -> do
-              logErr $ "  post: " <> T.unpack (T.take 100 line)
-              replCommit repl [line]) lines'
+            mapM_
+              ( \line -> do
+                  logErr $ "  post: " <> T.unpack (T.take 100 line)
+                  channelSend ch line
+              )
+              lines'
 
 logErr :: String -> IO ()
 logErr = TIO.hPutStrLn stderr . T.pack

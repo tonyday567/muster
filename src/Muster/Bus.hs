@@ -9,8 +9,8 @@
 -- log, cursor-based read, and pidfile-guarded watch.  The bus daemon opens the
 -- FIFO read-write so it never sees EOF between messages (the @cat \<>fifo@
 -- trick, without shelling out to @cat@).
-module Mailbox
-  ( MailboxPaths (..),
+module Muster.Bus
+  ( BusPaths (..),
     pathsFor,
     busStart,
     busStop,
@@ -21,19 +21,20 @@ module Mailbox
     readNew,
     wait,
     dumpLog,
+    countLogLines,
   )
 where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad (forever, unless, void, when)
-import Cursor qualified as Cur
 import Data.Char (isSpace)
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Muster.Cursor qualified as Cur
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
@@ -75,23 +76,25 @@ import Prelude
 -- Paths
 -- ---------------------------------------------------------------------------
 
-data MailboxPaths = MailboxPaths
-  { mbDir :: FilePath,
-    mbFifo :: FilePath,
-    mbLog :: FilePath,
-    mbErr :: FilePath,
-    mbPid :: FilePath
+-- | Standard files inside a channel directory.
+data BusPaths = BusPaths
+  { busDir :: FilePath,
+    busFifo :: FilePath,
+    busLog :: FilePath,
+    busErr :: FilePath,
+    busPid :: FilePath
   }
   deriving (Show, Eq)
 
-pathsFor :: FilePath -> MailboxPaths
+-- | Compute standard paths from a channel directory.
+pathsFor :: FilePath -> BusPaths
 pathsFor dir =
-  MailboxPaths
-    { mbDir = dir,
-      mbFifo = dir </> "bus.fifo",
-      mbLog = dir </> "log.md",
-      mbErr = dir </> "err.md",
-      mbPid = dir </> "bus.pid"
+  BusPaths
+    { busDir = dir,
+      busFifo = dir </> "bus.fifo",
+      busLog = dir </> "log.md",
+      busErr = dir </> "err.md",
+      busPid = dir </> "bus.pid"
     }
 
 watchPidFile :: FilePath -> FilePath -> FilePath
@@ -100,7 +103,6 @@ watchPidFile dir cursorfile =
   -- and takeBaseName would strip ".NAME" as a fake extension, collapsing every
   -- watcher onto one pidfile (".watch.pid-.watch") — multi-watcher death.
   let base = takeFileName cursorfile
-      -- Match bash: watchname="${cursorbase#.cursor-}"
       watchname = fromMaybe base (stripPrefix' ".cursor-" base)
    in dir </> ".watch.pid-" <> watchname
   where
@@ -112,17 +114,17 @@ pidToInt :: ProcessID -> Int
 pidToInt (CPid x) = fromIntegral x
 
 -- ---------------------------------------------------------------------------
--- Log metrics (not cursor position — see the @cursor@ package for that)
+-- Log metrics
 -- ---------------------------------------------------------------------------
 
--- | Count newline bytes in a log (match @wc -l@). Used for bus status and
--- post-grew checks; read/watch positions go through 'Cur.Cursor'.
-countNewlines :: FilePath -> IO Int
-countNewlines path = do
-  exists <- doesFileExist path
+-- | Count newline bytes in a log (match @wc -l@).
+countLogLines :: FilePath -> IO Int
+countLogLines dir = do
+  let p = pathsFor dir
+  exists <- doesFileExist (busLog p)
   if not exists
     then pure 0
-    else T.count "\n" <$> TIO.readFile path
+    else T.count "\n" <$> TIO.readFile (busLog p)
 
 -- ---------------------------------------------------------------------------
 -- Process liveness (kill -0)
@@ -163,9 +165,9 @@ waitExit ph n = do
       | n > 0 -> threadDelay 10000 >> waitExit ph (n - 1)
       | otherwise -> pure (ExitFailure 1)
 
-busRunning :: MailboxPaths -> IO (Maybe ProcessID)
+busRunning :: BusPaths -> IO (Maybe ProcessID)
 busRunning p = do
-  mpid <- readPidFile (mbPid p)
+  mpid <- readPidFile (busPid p)
   case mpid of
     Nothing -> pure Nothing
     Just pid -> do
@@ -184,7 +186,7 @@ signalKill pid = void $ do
   waitExit ph 50
 
 -- ---------------------------------------------------------------------------
--- Daemon (replaces `exec cat <>fifo`)
+-- Daemon
 -- ---------------------------------------------------------------------------
 
 -- | Long-running bus: open FIFO RDWR (never EOF between writers) and append
@@ -193,38 +195,27 @@ busDaemon :: FilePath -> IO ()
 busDaemon dir = do
   let p = pathsFor dir
   createDirectoryIfMissing True dir
-  -- Open FIFO read-write: keeps a write-end open so readers never see EOF
-  -- between messages (posix @open(O_RDWR)@ ≡ bash @cat \<>fifo@).
-  -- Using openFile (not fdToHandle) so hSetEncoding is respected.
-  h <- openFile (mbFifo p) ReadWriteMode
+  h <- openFile (busFifo p) ReadWriteMode
   hSetEncoding h utf8
   hSetBuffering h LineBuffering
-  logH <- openFile (mbLog p) AppendMode
+  logH <- openFile (busLog p) AppendMode
   hSetEncoding logH utf8
   hSetBuffering logH NoBuffering
   self <- getProcessID
-  writeFile (mbPid p) (show (pidToInt self) <> "\n")
+  writeFile (busPid p) (show (pidToInt self) <> "\n")
   relay h logH `finally` (hClose h >> hClose logH)
   where
-    -- Text + utf8: String hGetLine/hPutStrLn mojibake emoji/marks (ðŸ / â).
     relay :: Handle -> Handle -> IO ()
     relay h logH = forever do
       eof <- hIsEOF h
       if eof
-        then threadDelay 100000 -- should not happen with RDWR; back off
+        then threadDelay 100000
         else do
           line <- TIO.hGetLine h
           TIO.hPutStrLn logH line
           hFlush logH
 
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
-
--- | Start the bus daemon by re-execing this binary as @bus daemon@.
---
--- @channel@ and @busRoot@ are passed so the child resolves the same channel
--- directory the parent used.
+-- | Start the bus daemon by re-execing the current binary as @bus daemon@.
 busStart :: FilePath -> String -> FilePath -> IO ()
 busStart dir channel busRoot = do
   let p = pathsFor dir
@@ -233,18 +224,17 @@ busStart dir channel busRoot = do
   case running of
     Just pid -> putStrLn $ "bus already running (pid " <> show (pidToInt pid) <> ")"
     Nothing -> do
-      -- Clear stale pid / fifo (split-inode guard: always recreate fifo)
-      mpid <- readPidFile (mbPid p)
+      mpid <- readPidFile (busPid p)
       case mpid of
         Just pid -> signalKill pid
         Nothing -> pure ()
-      void $ try @IOException $ removeFile (mbPid p)
-      void $ try @IOException $ removeFile (mbFifo p)
-      createNamedPipe (mbFifo p) stdFileMode
-      appendFile (mbLog p) ""
-      appendFile (mbErr p) ""
+      void $ try @IOException $ removeFile (busPid p)
+      void $ try @IOException $ removeFile (busFifo p)
+      createNamedPipe (busFifo p) stdFileMode
+      appendFile (busLog p) ""
+      appendFile (busErr p) ""
       exe <- getExecutablePath
-      errH <- openFile (mbErr p) AppendMode
+      errH <- openFile (busErr p) AppendMode
       let cp =
             ( proc
                 exe
@@ -263,55 +253,52 @@ busStart dir channel busRoot = do
                 close_fds = True
               }
       (_, _, _, _ph) <- createProcess cp
-      -- errH is now owned by the child; do not close here if UseHandle transferred.
-      -- With UseHandle, parent must not use it further; closing is OK after spawn
-      -- only if the child dup'd — process docs say parent should close. Safe:
       hClose errH
       threadDelay 400000
       still <- busRunning p
       case still of
         Just pid ->
-          putStrLn $ "bus up (pid " <> show (pidToInt pid) <> ")  log=" <> mbLog p
+          putStrLn $ "bus up (pid " <> show (pidToInt pid) <> ")  log=" <> busLog p
         Nothing -> do
-          hPutStrLn stderr $ "bus FAILED to start; see " <> mbErr p
+          hPutStrLn stderr $ "bus FAILED to start; see " <> busErr p
           exitWith (ExitFailure 1)
 
 busStop :: FilePath -> IO ()
 busStop dir = do
   let p = pathsFor dir
-  mpid <- readPidFile (mbPid p)
+  mpid <- readPidFile (busPid p)
   case mpid of
     Nothing -> putStrLn "bus not running"
     Just pid -> do
       signalKill pid
-      void $ try @IOException $ removeFile (mbPid p)
+      void $ try @IOException $ removeFile (busPid p)
       putStrLn "bus stopped"
 
 busStatus :: FilePath -> IO ()
 busStatus dir = do
   let p = pathsFor dir
   running <- busRunning p
-  nLines <- countNewlines (mbLog p)
+  nLines <- countLogLines dir
   case running of
     Just pid ->
       putStrLn $
         "alive (pid "
           <> show (pidToInt pid)
           <> ")  log="
-          <> mbLog p
+          <> busLog p
           <> "  lines="
           <> show nLines
     Nothing -> do
-      mpid <- readPidFile (mbPid p)
+      mpid <- readPidFile (busPid p)
       let pidS = maybe "none" (show . pidToInt) mpid
       putStrLn $
         "DOWN (pidfile="
           <> pidS
           <> "; no healthy bus on "
-          <> mbFifo p
+          <> busFifo p
           <> ")"
 
--- | Compact liveness for channel listings: @"alive (pid N)"@ or @"down"@.
+-- | Compact liveness for channel listings.
 busLiveness :: FilePath -> IO String
 busLiveness dir = do
   running <- busRunning (pathsFor dir)
@@ -323,6 +310,7 @@ busLiveness dir = do
 -- Post / read / wait / log
 -- ---------------------------------------------------------------------------
 
+-- | Post a framed message to the channel. Fails if the bus is down.
 post :: FilePath -> String -> Text -> IO ()
 post dir sender body = do
   let p = pathsFor dir
@@ -332,16 +320,16 @@ post dir sender body = do
       hPutStrLn stderr "post FAILED: bus is down (run: muster bus start)"
       exitWith (ExitFailure 1)
     Just _ -> do
-      before <- countNewlines (mbLog p)
+      before <- countLogLines dir
       let framed = T.pack ("[" <> sender <> "] ") <> body <> "\n"
-      bracket (openFile (mbFifo p) WriteMode) hClose \h -> do
+      bracket (openFile (busFifo p) WriteMode) hClose \h -> do
         hSetEncoding h utf8
         hSetBuffering h NoBuffering
         TIO.hPutStr h framed
         hFlush h
-      ok <- checkGrew (mbLog p) before 20
+      ok <- checkGrew (busLog p) before 20
       unless ok do
-        after <- countNewlines (mbLog p)
+        after <- countLogLines dir
         hPutStrLn stderr $
           "post WARNING: log did not grow ("
             <> show before
@@ -352,7 +340,7 @@ post dir sender body = do
 
 checkGrew :: FilePath -> Int -> Int -> IO Bool
 checkGrew logPath before n = do
-  after <- countNewlines logPath
+  after <- T.count "\n" <$> TIO.readFile logPath
   if after > before
     then pure True
     else
@@ -360,29 +348,25 @@ checkGrew logPath before n = do
         then pure False
         else threadDelay 50000 >> checkGrew logPath before (n - 1)
 
+-- | Read new lines since the cursor file and print them.
 readNew :: FilePath -> FilePath -> IO ()
 readNew dir cursorfile = do
   let p = pathsFor dir
   createDirectoryIfMissing True dir
   c <- Cur.newFile cursorfile
-  ls <- Cur.pollFile c (mbLog p)
+  ls <- Cur.pollFile c (busLog p)
   mapM_ TIO.putStrLn ls
 
--- | Block until a non-excluded message appears. Exit 0 with printed lines,
--- 2 on timeout, 3 if another watcher is already live for this cursor.
---
--- Read position is a file-backed 'Cur.Cursor' (same type Repl could use
--- with 'Cur.newMem').
+-- | Block until a non-excluded message appears.
 wait ::
   FilePath ->
   FilePath ->
   Int ->
-  String -> -- exclude fixed-string prefix (e.g. "[grok] ")
+  String ->
   IO ExitCode
 wait dir cursorfile timeoutSec exclude = do
   let p = pathsFor dir
       wpid = watchPidFile dir cursorfile
-  -- Guard: refuse second watcher
   existing <- readPidFile wpid
   case existing of
     Just epid -> do
@@ -403,9 +387,9 @@ wait dir cursorfile timeoutSec exclude = do
     )
     `finally` cleanup
   where
-    go :: Cur.Cursor -> MailboxPaths -> Int -> IO ExitCode
+    go :: Cur.Cursor -> BusPaths -> Int -> IO ExitCode
     go c p elapsed = do
-      ls <- Cur.pollFile c (mbLog p)
+      ls <- Cur.pollFile c (busLog p)
       if not (null ls)
         then do
           let woke =
@@ -413,7 +397,7 @@ wait dir cursorfile timeoutSec exclude = do
                   then ls
                   else filter (not . (T.pack exclude `T.isPrefixOf`)) ls
           if null woke
-            then go c p elapsed -- only own/filtered traffic; cursor already advanced
+            then go c p elapsed
             else do
               mapM_ TIO.putStrLn woke
               hFlush stdout
@@ -427,8 +411,9 @@ wait dir cursorfile timeoutSec exclude = do
               threadDelay 1000000
               go c p (elapsed + 1)
 
+-- | Dump the full channel log to stdout.
 dumpLog :: FilePath -> IO ()
 dumpLog dir = do
   let p = pathsFor dir
-  exists <- doesFileExist (mbLog p)
-  when exists $ TIO.readFile (mbLog p) >>= TIO.putStr
+  exists <- doesFileExist (busLog p)
+  when exists $ TIO.readFile (busLog p) >>= TIO.putStr

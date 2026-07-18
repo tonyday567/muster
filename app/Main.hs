@@ -21,7 +21,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
-import Mailbox qualified as MB
+import Muster.Bus qualified as Bus
 import Options.Applicative
 import System.Directory
 import System.Environment (getEnv, lookupEnv)
@@ -442,10 +442,10 @@ runBus opts = \case
   BusStart -> do
     dir <- channelDir opts
     root <- busRoot opts
-    MB.busStart dir (globalChannel opts) root
-  BusStop -> channelDir opts >>= MB.busStop
-  BusStatus -> channelDir opts >>= MB.busStatus
-  BusDaemon -> channelDir opts >>= MB.busDaemon
+    Bus.busStart dir (globalChannel opts) root
+  BusStop -> channelDir opts >>= Bus.busStop
+  BusStatus -> channelDir opts >>= Bus.busStatus
+  BusDaemon -> channelDir opts >>= Bus.busDaemon
 
 runJoin :: Global -> String -> IO ()
 runJoin opts name = do
@@ -456,7 +456,7 @@ runJoin opts name = do
   if exists
     then putStrLn $ "[" <> name <> "] already joined in " <> globalChannel opts
     else do
-      total <- countLogLines dir
+      total <- Bus.countLogLines dir
       writeFile cursor (show total <> "\n")
       putStrLn $ "[" <> name <> "] joined " <> globalChannel opts <> "; cursor at line " <> show total
   -- If a session is open on this channel, add the participant.
@@ -484,7 +484,7 @@ runPost opts args = do
     hPutStrLn stderr "muster: empty message"
     exitWith (ExitFailure 1)
   dir <- channelDir opts
-  MB.post dir name msg
+  Bus.post dir name msg
 
 requireCursor :: Global -> String -> IO FilePath
 requireCursor opts name = do
@@ -501,7 +501,7 @@ runRead opts mname = do
   name <- resolveName opts mname
   cursor <- requireCursor opts name
   dir <- channelDir opts
-  MB.readNew dir cursor
+  Bus.readNew dir cursor
 
 -- | Cursor participant names in a channel directory (sorted).
 cursorNames :: FilePath -> IO [String]
@@ -588,8 +588,8 @@ initWatchCursor dir joinCursor watchCursor = do
         txt <- readFile joinCursor
         case readMaybe (filter (not . isSpace) txt) of
           Just i -> pure i
-          Nothing -> countLogLines dir
-      False -> countLogLines dir
+          Nothing -> Bus.countLogLines dir
+      False -> Bus.countLogLines dir
   writeFile watchCursor (show n <> "\n")
 
 runWatch :: Global -> Maybe String -> Maybe Int -> IO ()
@@ -602,7 +602,7 @@ runWatch opts mname mto = do
   unless exists $ initWatchCursor dir joinCursor wc
   let timeout = fromMaybe 86400 mto
   let loop = do
-        exit <- MB.wait dir wc timeout ("[" <> name <> "] ")
+        exit <- Bus.wait dir wc timeout ("[" <> name <> "] ")
         case exit of
           ExitSuccess -> loop
           ExitFailure 2 -> pure () -- timeout expired
@@ -623,7 +623,7 @@ runNames opts = do
         else mapM_ putStrLn cursors
 
 runLog :: Global -> IO ()
-runLog opts = channelDir opts >>= MB.dumpLog
+runLog opts = channelDir opts >>= Bus.dumpLog
 
 -- | Wipe a channel: cursors, watches, log, fifo, pid. Bus must be down.
 --
@@ -642,7 +642,7 @@ runClean opts channel yes = do
   unless exists do
     hPutStrLn stderr $ "muster: no channel directory " <> dir
     exitWith (ExitFailure 1)
-  live <- MB.busLiveness dir
+  live <- Bus.busLiveness dir
   unless (live == "down") do
     hPutStrLn stderr $
       "muster: bus is "
@@ -653,7 +653,7 @@ runClean opts channel yes = do
         <> channel
         <> " bus stop)"
     exitWith (ExitFailure 1)
-  nLines <- countLogLines dir
+  nLines <- Bus.countLogLines dir
   nParts <- length <$> cursorNames dir
   unless yes do
     putStr $
@@ -713,7 +713,7 @@ runPrune opts channel keep yes = do
   unless exists do
     hPutStrLn stderr $ "muster: no channel directory " <> dir
     exitWith (ExitFailure 1)
-  live <- MB.busLiveness dir
+  live <- Bus.busLiveness dir
   unless (live == "down") do
     hPutStrLn stderr $
       "muster: bus is "
@@ -827,9 +827,9 @@ runChannels opts = do
       hasLog <- doesFileExist (logFile dir)
       if isDir && hasLog
         then do
-          nLines <- countLogLines dir
+          nLines <- Bus.countLogLines dir
           nParts <- countParticipants dir
-          live <- MB.busLiveness dir
+          live <- Bus.busLiveness dir
           pure [(name, nLines, nParts, live)]
         else pure []
 
@@ -864,13 +864,13 @@ runSessionOpen opts = do
   dir <- channelDir opts
   createDirectoryIfMissing True dir
   root <- busRoot opts
-  MB.busStart dir (globalChannel opts) root
+  Bus.busStart dir (globalChannel opts) root
   ms <- readSession (sessionFile dir)
   case ms of
     Just s | sessStatus s == "open" ->
       putStrLn $ "session already open on " <> globalChannel opts <> " (since " <> sessOpened s <> ")"
     _ -> do
-      n <- countLogLines dir
+      n <- Bus.countLogLines dir
       t <- nowIso
       let s = SessionState {sessStatus = "open", sessOpened = t, sessParticipants = [], sessLogStart = n}
       writeSession (sessionFile dir) s
@@ -907,7 +907,7 @@ runSessionClose opts = do
       t <- nowIso
       let s' = s {sessStatus = "closed", sessOpened = sessOpened s <> "; closed: " <> t}
       writeSession (sessionFile dir) s'
-      MB.busStop dir
+      Bus.busStop dir
       putStrLn $ "session closed on " <> globalChannel opts
 
 runSessionStatus :: Global -> IO ()
@@ -948,14 +948,6 @@ runSessionList opts = do
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
-
-countLogLines :: FilePath -> IO Int
-countLogLines dir = do
-  let logPath = logFile dir
-  exists <- doesFileExist logPath
-  if not exists
-    then pure 0
-    else T.count "\n" <$> TIO.readFile logPath
 
 validateName :: String -> IO ()
 validateName name
