@@ -18,10 +18,8 @@ module Muster.Connector
   )
 where
 
-import Circuit (run)
 import Circuit.Ends (Ends (..), HasUnit (..), In (..), Out (..), commit, emit)
 import Circuit.Repl (ProcessPorts (..), ReplConfig (..), defaultReplConfig, openProcessPorts)
-import Circuit.Trace (Trace (..))
 import Control.Arrow (Kleisli (..), runKleisli)
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
@@ -150,24 +148,18 @@ postOutput ch turn outLines errLines = do
       body = T.unlines $ [outHeader, "", "-- stdout --"] <> outLines <> ["", "-- stderr --"] <> errLines
   channelSend ch body
 
-runOut :: In (Kleisli IO) a -> Out (Kleisli IO) b -> Trace (,) (Kleisli IO) a b
-runOut i o = Arr (commit i o)
-
-runIn :: Out (Kleisli IO) b -> In (Kleisli IO) a -> Trace (,) (Kleisli IO) a b
-runIn o i = Arr (emit o i)
-
 commitLines :: ProcessPorts [Text] [Text] [Text] -> [Text] -> IO ()
-commitLines pp ts = runKleisli (run (runOut (peIn pp) outU)) ts
+commitLines pp ts = runKleisli (commit (peIn pp) outU) ts
   where
     Ends _ outU = open
 
 emitOut :: ProcessPorts [Text] [Text] [Text] -> IO [Text]
-emitOut pp = runKleisli (run (runIn (peOut pp) inU)) ()
+emitOut pp = runKleisli (emit (peOut pp) inU) ()
   where
     Ends inU _ = open
 
 emitErr :: ProcessPorts [Text] [Text] [Text] -> IO [Text]
-emitErr pp = runKleisli (run (runIn (peErr pp) inU)) ()
+emitErr pp = runKleisli (emit (peErr pp) inU) ()
   where
     Ends inU _ = open
 
