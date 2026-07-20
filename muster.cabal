@@ -184,7 +184,6 @@ executable muster-alert
 
     build-depends:
         base,
-        muster,
         directory,
         filepath,
         process,

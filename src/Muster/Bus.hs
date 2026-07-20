@@ -19,6 +19,7 @@ module Muster.Bus
     busDaemon,
     post,
     readNew,
+    readTail,
     wait,
     dumpLog,
     countLogLines,
@@ -356,6 +357,29 @@ readNew dir cursorfile = do
   c <- Cur.newFile cursorfile
   ls <- Cur.pollFile c (busLog p)
   mapM_ TIO.putStrLn ls
+
+-- | Read the last @n@ lines of the log, advancing the cursor to the end.
+--
+-- This is the default behaviour for @muster read@: it gives a newcomer (or a
+-- long-polling session) a bounded window instead of dumping the entire backlog.
+readTail :: FilePath -> FilePath -> Int -> IO ()
+readTail dir cursorfile n = do
+  let p = pathsFor dir
+      logPath = busLog p
+  createDirectoryIfMissing True dir
+  c <- Cur.newFile cursorfile
+  ls <-
+    doesFileExist logPath >>= \case
+      False -> pure []
+      True -> T.lines <$> TIO.readFile logPath
+  Cur.seekEnd c ls
+  mapM_ TIO.putStrLn (takeLast n ls)
+
+-- | Last @n@ elements of a list.
+takeLast :: Int -> [a] -> [a]
+takeLast n xs
+  | n <= 0 = []
+  | otherwise = drop (max 0 (length xs - n)) xs
 
 -- | Block until a non-excluded message appears.
 wait ::

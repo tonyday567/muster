@@ -196,7 +196,7 @@ data Cmd
   | CmdJoin String
   | CmdLeave String
   | CmdPost [String]
-  | CmdRead (Maybe String)
+  | CmdRead (Maybe String) (Maybe Int) Bool
   | CmdWatch (Maybe String) (Maybe Int)
   | CmdNames
   | CmdLog
@@ -253,6 +253,24 @@ yesOpt =
         <> help "Skip confirmation prompt"
     )
 
+tailOpt :: Parser (Maybe Int)
+tailOpt =
+  optional
+    $ option
+      auto
+      ( long "tail"
+          <> short 'n'
+          <> metavar "N"
+          <> help "Show the last N log lines (default: 20)"
+      )
+
+allOpt :: Parser Bool
+allOpt =
+  switch
+    ( long "all"
+        <> help "Show all unread lines since the cursor (old default)"
+    )
+
 keepOpt :: Parser Int
 keepOpt =
   option
@@ -279,8 +297,8 @@ cmdParser =
         <> command
           "read"
           ( info
-              (CmdRead <$> optionalNameArg)
-              (progDesc "Read new messages (NAME optional if MUSTER_NAME or sole cursor)")
+              (CmdRead <$> optionalNameArg <*> tailOpt <*> allOpt)
+              (progDesc "Read messages (NAME optional if MUSTER_NAME or sole cursor; default --tail 20)")
           )
         <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt) (progDesc "Block until someone posts"))
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
@@ -496,12 +514,14 @@ requireCursor opts name = do
     exitWith (ExitFailure 1)
   pure cursor
 
-runRead :: Global -> Maybe String -> IO ()
-runRead opts mname = do
+runRead :: Global -> Maybe String -> Maybe Int -> Bool -> IO ()
+runRead opts mname mtail allFlag = do
   name <- resolveName opts mname
   cursor <- requireCursor opts name
   dir <- channelDir opts
-  Bus.readNew dir cursor
+  if allFlag
+    then Bus.readNew dir cursor
+    else Bus.readTail dir cursor (fromMaybe 20 mtail)
 
 -- | Cursor participant names in a channel directory (sorted).
 cursorNames :: FilePath -> IO [String]
@@ -1239,7 +1259,7 @@ main = do
     CmdJoin name -> runJoin opts name
     CmdLeave name -> runLeave opts name
     CmdPost args -> runPost opts args
-    CmdRead mname -> runRead opts mname
+    CmdRead mname mtail allFlag -> runRead opts mname mtail allFlag
     CmdWatch mname mto -> runWatch opts mname mto
     CmdNames -> runNames opts
     CmdLog -> runLog opts
