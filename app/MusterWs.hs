@@ -73,7 +73,9 @@ data Opts = Opts
     optHost :: String,
     optPort :: Int,
     optHistory :: Int,
-    optBoard :: FilePath
+    optBoard :: FilePath,
+    optDev :: Bool,
+    optDevPath :: FilePath
   }
 
 optsP :: Parser Opts
@@ -86,6 +88,8 @@ optsP =
     <*> option auto (long "port" <> short 'p' <> value 9162 <> showDefault)
     <*> option auto (long "history" <> value 80 <> showDefault <> help "Log lines on WS connect")
     <*> strOption (long "board" <> value "" <> help "Default: $HOME/mg/loom/board.md")
+    <*> switch (long "dev" <> help "Serve deck.html from disk (dev mode)")
+    <*> strOption (long "dev-path" <> value "app/deck.html" <> showDefault <> help "Path to deck.html in dev mode")
 
 main :: IO ()
 main = do
@@ -119,7 +123,7 @@ main = do
     void $ async $ busPump ch busFan
     let wsApp = clientApp ch name busFan logf (optHistory o)
         chan = T.pack (optChannel o)
-        httpApp = staticApp boardPath agentsDir logf chan name
+        httpApp = staticApp boardPath agentsDir logf chan name (optDev o) (optDevPath o)
         app = websocketsOr defaultConnectionOptions wsApp httpApp
     run (optPort o) app
 
@@ -139,10 +143,10 @@ busPump ch fan = forever $ do
   mapM_ (atomically . writeTChan fan) lines'
   when (null lines') $ threadDelay 50_000
 
-staticApp :: FilePath -> FilePath -> FilePath -> Text -> Text -> Application
-staticApp boardPath agentsDir logf channel identity req respond =
+staticApp :: FilePath -> FilePath -> FilePath -> Text -> Text -> Bool -> FilePath -> Application
+staticApp boardPath agentsDir logf channel identity dev devPath req respond =
   case pathInfo req of
-    [] -> serveHtml respond
+    [] -> serveHtml dev devPath respond
     ["api", "state"] -> do
       body <- buildStateJson boardPath agentsDir logf channel identity
       respond $
@@ -175,15 +179,25 @@ staticApp boardPath agentsDir logf channel identity req respond =
       respond $
         responseLBS status404 [("Content-Type", "text/plain")] "not found"
 
-serveHtml :: (Response -> IO a) -> IO a
-serveHtml respond =
+serveHtml :: Bool -> FilePath -> (Response -> IO a) -> IO a
+serveHtml dev devPath respond = do
+  html <-
+    if not dev
+      then pure deckHtml
+      else do
+        res <- try @IOException (LBS.readFile devPath)
+        case res of
+          Left err -> do
+            putStrLn $ "muster-ws: dev mode failed to read " <> devPath <> ": " <> show err
+            pure deckHtml
+          Right bytes -> pure bytes
   respond $
     responseLBS
       status200
       [ ("Content-Type", "text/html; charset=utf-8"),
         ("Cache-Control", "no-store, no-cache, must-revalidate")
       ]
-      deckHtml
+      html
 
 buildStateJson :: FilePath -> FilePath -> FilePath -> Text -> Text -> IO Text
 buildStateJson boardPath agentsDir logf channel identity = do

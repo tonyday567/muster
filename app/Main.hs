@@ -200,7 +200,7 @@ data SessionCmd
   deriving (Show, Eq)
 
 data DeskCmd
-  = DeskStart String Int
+  = DeskStart String Int Bool
   | DeskStop
   | DeskStatus
   deriving (Show, Eq)
@@ -479,13 +479,20 @@ deskPortOpt =
         <> help "HTTP port"
     )
 
+deskDevOpt :: Parser Bool
+deskDevOpt =
+  switch
+    ( long "dev"
+        <> help "Serve deck.html from disk (app/deck.html) instead of embedded"
+    )
+
 deskCmdParser :: Parser DeskCmd
 deskCmdParser =
   hsubparser
     ( command
         "start"
         ( info
-            (DeskStart <$> deskNameOpt <*> deskPortOpt)
+            (DeskStart <$> deskNameOpt <*> deskPortOpt <*> deskDevOpt)
             (progDesc "Start the web desk")
         )
         <> command "stop" (info (pure DeskStop) (progDesc "Stop the web desk"))
@@ -1248,12 +1255,12 @@ deskPidFile dir = dir </> "desk.pid"
 
 runDesk :: Global -> DeskCmd -> IO ()
 runDesk opts = \case
-  DeskStart name port -> runDeskStart opts name port
+  DeskStart name port dev -> runDeskStart opts name port dev
   DeskStop -> runDeskStop opts
   DeskStatus -> runDeskStatus opts
 
-runDeskStart :: Global -> String -> Int -> IO ()
-runDeskStart opts name port = do
+runDeskStart :: Global -> String -> Int -> Bool -> IO ()
+runDeskStart opts name port dev = do
   dir <- channelDir opts
   createDirectoryIfMissing True dir
   let pidPath = deskPidFile dir
@@ -1271,10 +1278,11 @@ runDeskStart opts name port = do
           "--channel", globalChannel opts,
           "--port", show port
         ]
+      devArg = if dev then ["--dev"] else []
       rootArg = case globalBusRoot opts of
         "" -> []
         r -> ["--bus-root", r]
-      allArgs = args <> rootArg
+      allArgs = args <> devArg <> rootArg
       sh =
         "nohup muster-ws "
           <> unwords allArgs
