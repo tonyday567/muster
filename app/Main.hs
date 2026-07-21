@@ -186,7 +186,7 @@ formatBefore secs = do
 data BusCmd = BusStart | BusStop | BusStatus | BusDaemon deriving (Show, Eq)
 
 data AgentCmd
-  = AgentNew String (Maybe String) (Maybe String)
+  = AgentNew String (Maybe String) (Maybe String) (Maybe String)
   | AgentStop String
   | AgentStatus (Maybe String)
   | AgentList
@@ -386,6 +386,16 @@ busCmdParser =
         <> command "daemon" (info (pure BusDaemon) (progDesc "Internal: run the bus relay loop"))
     )
 
+agentCmdOpt :: Parser (Maybe String)
+agentCmdOpt =
+  optional $
+    strOption
+      ( long "agent"
+          <> short 'a'
+          <> metavar "CMD"
+          <> help "Agent CLI command (default: hermes)"
+      )
+
 agentModelOpt :: Parser (Maybe String)
 agentModelOpt =
   optional $
@@ -413,6 +423,7 @@ agentCmdParser =
         ( info
             ( AgentNew
                 <$> nameArg
+                <*> agentCmdOpt
                 <*> agentModelOpt
                 <*> agentProviderOpt
             )
@@ -1093,11 +1104,12 @@ killPid pid = void $ do
   waitForProcess ph
 
 -- | Start the long-lived Haskell agent bridge.
-runAgentNew :: Global -> String -> Maybe String -> Maybe String -> IO ()
-runAgentNew opts name mModel mProvider = do
+runAgentNew :: Global -> String -> Maybe String -> Maybe String -> Maybe String -> IO ()
+runAgentNew opts name mAgent mModel mProvider = do
   validateName name
-  -- join channel so bus identity exists
-  runJoin opts name
+  -- Agents are symmetric to humans: `muster agent new` creates the agent
+  -- state but does NOT join any channel.  The operator joins the agent to
+  -- one or more channels explicitly with `muster join <name> -c <channel>`.
   adir <- agentDir opts name
   createDirectoryIfMissing True adir
   let pidPath = adir </> "agent.pid"
@@ -1113,11 +1125,14 @@ runAgentNew opts name mModel mProvider = do
     Nothing -> pure ()
   homeModel <- lookupEnv "HERMES_MODEL"
   homeProv <- lookupEnv "HERMES_PROVIDER"
-  let model = fromMaybe (fromMaybe "deepseek-v4-pro" homeModel) mModel
+  let agentCmd = fromMaybe "hermes" mAgent
+      model = fromMaybe (fromMaybe "deepseek-v4-pro" homeModel) mModel
       provider = fromMaybe (fromMaybe "deepseek" homeProv) mProvider
   writeFile cfgPath $
     unlines
       [ "name=" <> name,
+        "channel=" <> name,
+        "agent=" <> agentCmd,
         "model=" <> model,
         "provider=" <> provider
       ]
@@ -1126,8 +1141,8 @@ runAgentNew opts name mModel mProvider = do
         r -> ["--bus-root", r]
       args =
         busRootArg
-          <> ["--channel", globalChannel opts]
           <> ["--name", name]
+          <> ["--agent", agentCmd]
           <> ["--model", model]
           <> ["--provider", provider]
       sh =
@@ -1221,7 +1236,7 @@ runAgentList opts = do
 
 runAgent :: Global -> AgentCmd -> IO ()
 runAgent opts = \case
-  AgentNew name mModel mProvider -> runAgentNew opts name mModel mProvider
+  AgentNew name mAgent mModel mProvider -> runAgentNew opts name mAgent mModel mProvider
   AgentStop name -> runAgentStop opts name
   AgentStatus Nothing -> runAgentList opts
   AgentStatus (Just name) -> runAgentStatusOne opts name
