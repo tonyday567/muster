@@ -29,7 +29,7 @@ import Muster.Channel (Channel, ChannelConfig (..), channelAttach, channelRecv, 
 import Muster.Connector (ConnectorConfig (..), defaultConnectorConfig, runConnector)
 import Options.Applicative
 import System.Directory (doesFileExist, getHomeDirectory)
-import System.Environment (getEnv, lookupEnv)
+import System.Environment (getEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO (stderr)
@@ -112,12 +112,12 @@ configParser =
           <> value ""
           <> showDefault
           <> metavar "DIR"
-          <> help "Root directory for all bus state (default: $HOME/mg/logs/muster)"
+          <> help "Root directory for all bus state (default: $HOME/.config/muster)"
       )
     <*> strOption
       ( long "channel"
           <> short 'c'
-          <> value "general"
+          <> value "bus"
           <> showDefault
           <> metavar "CHANNEL"
           <> help "Muster channel"
@@ -141,11 +141,7 @@ busRoot cfg = do
   let explicit = maBusRoot cfg
   if not (null explicit)
     then pure explicit
-    else do
-      menv <- lookupEnv "MUSTER_ROOT"
-      case menv of
-        Just d | not (null d) -> pure d
-        _ -> (</> "mg/logs/muster") <$> getEnv "HOME"
+    else (</> ".config/muster") <$> getEnv "HOME"
 
 channelDir :: MusterAgentConfig -> IO FilePath
 channelDir cfg = do

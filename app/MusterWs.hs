@@ -17,11 +17,10 @@ import Muster.Channel
     ChannelConfig (..),
     channelAttach,
     channelClose,
-    channelRecv,
+    channelRecvRaw,
     channelSend,
     defaultChannelConfig,
   )
-import Muster.Framing (frameMessage)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitEither)
 import Control.Concurrent.STM
@@ -55,7 +54,7 @@ import Network.WebSockets
   )
 import Options.Applicative
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
-import System.Environment (getEnv, lookupEnv)
+import System.Environment (getEnv)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hFlush, stdout)
 import System.Posix.Signals (nullSignal, signalProcess)
@@ -81,7 +80,7 @@ optsP :: Parser Opts
 optsP =
   Opts
     <$> strOption (long "name" <> short 'n' <> value "desk" <> showDefault <> help "Bus identity")
-    <*> strOption (long "channel" <> short 'c' <> value "general" <> showDefault)
+    <*> strOption (long "channel" <> short 'c' <> value "bus" <> showDefault)
     <*> strOption (long "bus-root" <> value "" <> help "Default: $HOME/mg/logs/muster")
     <*> strOption (long "host" <> value "127.0.0.1" <> showDefault)
     <*> option auto (long "port" <> short 'p' <> value 9162 <> showDefault)
@@ -127,11 +126,7 @@ main = do
 resolveRoot :: FilePath -> IO FilePath
 resolveRoot explicit
   | not (null explicit) = pure explicit
-  | otherwise = do
-      menv <- lookupEnv "MUSTER_ROOT"
-      case menv of
-        Just d | not (null d) -> pure d
-        _ -> (</> "mg/logs/muster") <$> getEnv "HOME"
+  | otherwise = (</> ".config/muster") <$> getEnv "HOME"
 
 resolveBoard :: FilePath -> IO FilePath
 resolveBoard explicit
@@ -140,13 +135,9 @@ resolveBoard explicit
 
 busPump :: Channel -> TChan Text -> IO ()
 busPump ch fan = forever $ do
-  msgs <- channelRecv ch
-  mapM_
-    ( \(sender, body) ->
-        atomically $ writeTChan fan (frameMessage sender body)
-    )
-    msgs
-  when (null msgs) $ threadDelay 50_000
+  lines' <- channelRecvRaw ch
+  mapM_ (atomically . writeTChan fan) lines'
+  when (null lines') $ threadDelay 50_000
 
 staticApp :: FilePath -> FilePath -> FilePath -> Text -> Text -> Application
 staticApp boardPath agentsDir logf channel identity req respond =
@@ -465,3 +456,4 @@ readHistory path n = do
       raw <- TIO.readFile path
       let ls = filter (not . T.null) $ T.lines raw
       pure $ drop (max 0 (length ls - n)) ls
+ 

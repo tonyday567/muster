@@ -36,6 +36,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Muster.Cursor qualified as Cur
+import Muster.Framing (formatNow)
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
@@ -322,7 +323,9 @@ post dir sender body = do
       exitWith (ExitFailure 1)
     Just _ -> do
       before <- countLogLines dir
-      let framed = T.pack ("[" <> sender <> "] ") <> body <> "\n"
+      ts <- formatNow
+      let sender' = T.pack sender
+          framed = "[" <> ts <> "] " <> sender' <> ": " <> body <> "\n"
       bracket (openFile (busFifo p) WriteMode) hClose \h -> do
         hSetEncoding h utf8
         hSetBuffering h NoBuffering
@@ -381,14 +384,22 @@ takeLast n xs
   | n <= 0 = []
   | otherwise = drop (max 0 (length xs - n)) xs
 
--- | Block until a non-excluded message appears.
+-- | Block until a message matching the filter appears.
+--
+-- The filter predicate receives each raw log line. Return 'True' to wake
+-- and print; 'False' to skip (the line is not printed and the wait
+-- continues). Pass @const True@ to wake on any message.
+--
+-- When messages arrive but none pass the filter (e.g. self-posts), the
+-- elapsed counter is reset to zero — the bus IS alive and delivering,
+-- just not messages this watcher cares about.
 wait ::
   FilePath ->
   FilePath ->
   Int ->
-  String ->
+  (Text -> Bool) ->
   IO ExitCode
-wait dir cursorfile timeoutSec exclude = do
+wait dir cursorfile timeoutSec keep = do
   let p = pathsFor dir
       wpid = watchPidFile dir cursorfile
   existing <- readPidFile wpid
@@ -416,12 +427,12 @@ wait dir cursorfile timeoutSec exclude = do
       ls <- Cur.pollFile c (busLog p)
       if not (null ls)
         then do
-          let woke =
-                if null exclude
-                  then ls
-                  else filter (not . (T.pack exclude `T.isPrefixOf`)) ls
+          let woke = filter keep ls
           if null woke
-            then go c p elapsed
+            then -- Messages arrived but none passed filter (e.g. self-posts).
+            -- The bus is alive but not for us; count the polling interval
+            -- toward the timeout rather than waiting forever.
+                 threadDelay 1000000 >> go c p (elapsed + 1)
             else do
               mapM_ TIO.putStrLn woke
               hFlush stdout

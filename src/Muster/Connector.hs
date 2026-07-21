@@ -49,7 +49,7 @@ defaultConnectorConfig :: Text -> ConnectorConfig
 defaultConnectorConfig name =
   ConnectorConfig
     { connName = name,
-      connChannel = "general",
+      connChannel = "bus",
       connBusRoot = "",
       connProject = ".",
       connCommand = "cabal",

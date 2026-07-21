@@ -20,7 +20,7 @@ import Control.Exception (IOException, bracket, try)
 import Control.Monad (void, when)
 import Data.List (isPrefixOf)
 import System.Directory (doesFileExist, removeFile)
-import System.Environment (getArgs, getEnv, lookupEnv)
+import System.Environment (getArgs, getEnv)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.IO
@@ -67,14 +67,14 @@ main = do
 usage :: IO ()
 usage = do
   putStrLn "Usage: muster-alert [-c <channel>] [-l|--loop] <prefix> <name>"
-  putStrLn "  -c        channel (default: general)"
+  putStrLn "  -c        channel (default: bus)"
   putStrLn "  -l, --loop  continuous mode: re-arm after each match"
   putStrLn "  prefix:   line prefix to match, e.g. '[desk]'"
   putStrLn "  name:     watcher name passed to 'muster watch'"
   exitFailure
 
 parseArgs :: [String] -> Maybe Config
-parseArgs args = go args (Config "general" False "" "")
+parseArgs args = go args (Config "bus" False "" "")
   where
     go [] cfg = Just cfg
     go ("-c" : c : rest) cfg = go rest (cfg {cfgChannel = c})
@@ -130,11 +130,7 @@ runAlert cfg = do
                 else loop h ph
 
 resolveRoot :: IO FilePath
-resolveRoot = do
-  menv <- lookupEnv "MUSTER_ROOT"
-  case menv of
-    Just d | not (null d) -> pure d
-    _ -> (</> "mg/logs/muster") <$> getEnv "HOME"
+resolveRoot = (</> ".config/muster") <$> getEnv "HOME"
 
 cleanStalePid :: FilePath -> IO ()
 cleanStalePid path = do

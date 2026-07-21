@@ -5,8 +5,8 @@
 -- | muster — ad-hoc multiplicity events over named bus channels.
 --
 -- An IRC-flavoured front-end to the shared append-only mailbox. Channels are
--- isolated under @~/mg/logs/muster/<channel>@; the default channel is
--- @general@.  The engine is native Haskell ('Mailbox'); the bash
+-- isolated under @~/.config/muster/<channel>@; the default channel is
+-- @bus@.  The engine is native Haskell ('Mailbox'); the bash
 -- @mailbox.sh@ remains available on disk for rollback but is no longer
 -- invoked from this binary.
 module Main (main) where
@@ -14,13 +14,13 @@ module Main (main) where
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, try)
 import Control.Monad (unless, void, when)
-import Data.Char (isSpace)
+import Data.Char (isDigit, isSpace)
 import Data.List (dropWhileEnd, intercalate, isPrefixOf, sort)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
+import Data.Time (defaultTimeLocale, addUTCTime, formatTime, getCurrentTime)
 import Muster.Bus qualified as Bus
 import Options.Applicative
 import System.Directory
@@ -54,7 +54,7 @@ globalParser =
     <$> strOption
       ( long "channel"
           <> short 'c'
-          <> value "general"
+          <> value "bus"
           <> showDefault
           <> metavar "CHANNEL"
           <> help "Muster channel"
@@ -64,7 +64,7 @@ globalParser =
           <> value ""
           <> showDefault
           <> metavar "DIR"
-          <> help "Root directory for all bus state (default: $HOME/mg/logs/muster)"
+          <> help "Root directory for all bus state (default: $HOME/.config/muster)"
       )
 
 -- ---------------------------------------------------------------------------
@@ -76,15 +76,11 @@ globalParser =
 -- Preference order:
 --   1. @--bus-root@ if non-empty
 --   2. @MAILBOX_DIR@ env if non-empty (treated as a single-channel dir root parent)
---   3. @$HOME/mg/logs/muster@
+--   3. @$HOME/.config/muster@
 busRoot :: Global -> IO FilePath
 busRoot (Global _ root)
   | not (null root) = pure root
-busRoot _ = do
-  menv <- lookupEnv "MAILBOX_DIR"
-  case menv of
-    Just d | not (null d) -> pure d
-    _ -> (</> "mg/logs/muster") <$> getEnv "HOME"
+busRoot _ = (</> ".config/muster") <$> getEnv "HOME"
 
 -- | Directory for a specific channel.
 channelDir :: Global -> IO FilePath
@@ -165,6 +161,24 @@ readSession path = do
 nowIso :: IO String
 nowIso = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S" <$> getCurrentTime
 
+-- | Parse a duration string like \"5m\", \"1h\", \"30s\" into seconds.
+parseDuration :: String -> Maybe Int
+parseDuration s = case span isDigit s of
+  ([], _) -> Nothing
+  (ds, unit)
+    | null unit || unit == "s" -> Just (read ds)
+    | unit == "m" -> Just (read ds * 60)
+    | unit == "h" -> Just (read ds * 3600)
+    | unit == "d" -> Just (read ds * 86400)
+    | otherwise -> Nothing
+
+-- | Produce an ISO-8601 timestamp N seconds before now.
+formatBefore :: Int -> IO String
+formatBefore secs = do
+  t <- getCurrentTime
+  let t' = addUTCTime (fromIntegral (-secs)) t
+  pure $ formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S" t'
+
 -- ---------------------------------------------------------------------------
 -- Commands
 -- ---------------------------------------------------------------------------
@@ -197,7 +211,7 @@ data Cmd
   | CmdLeave String
   | CmdPost [String]
   | CmdRead (Maybe String) (Maybe Int) Bool
-  | CmdWatch (Maybe String) (Maybe Int)
+  | CmdWatch (Maybe String) (Maybe Int) (Maybe String) (Maybe String) Bool
   | CmdNames
   | CmdLog
   | CmdChannels
@@ -244,6 +258,33 @@ timeoutOpt =
           <> metavar "SECONDS"
           <> help "Give up after this many seconds (default: block until mail)"
       )
+
+filterOpt :: Parser (Maybe String)
+filterOpt =
+  optional
+    $ strOption
+      ( long "filter"
+          <> short 'f'
+          <> metavar "REGEX"
+          <> help "Only wake on lines matching this substring/regex"
+      )
+
+sinceOpt :: Parser (Maybe String)
+sinceOpt =
+  optional
+    $ strOption
+      ( long "since"
+          <> metavar "DURATION"
+          <> help "Only wake on messages newer than this (e.g. 5m, 1h)"
+      )
+
+loopOpt :: Parser Bool
+loopOpt =
+  switch
+    ( long "loop"
+        <> short 'l'
+        <> help "Continuous mode: re-arm after each match"
+    )
 
 yesOpt :: Parser Bool
 yesOpt =
@@ -300,7 +341,7 @@ cmdParser =
               (CmdRead <$> optionalNameArg <*> tailOpt <*> allOpt)
               (progDesc "Read messages (NAME optional if MUSTER_NAME or sole cursor; default --tail 20)")
           )
-        <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt) (progDesc "Block until someone posts"))
+        <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt <*> filterOpt <*> sinceOpt <*> loopOpt) (progDesc "Block until someone posts"))
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
         <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
         <> command "channels" (info (pure CmdChannels) (progDesc "List all channels with metadata"))
@@ -612,8 +653,8 @@ initWatchCursor dir joinCursor watchCursor = do
       False -> Bus.countLogLines dir
   writeFile watchCursor (show n <> "\n")
 
-runWatch :: Global -> Maybe String -> Maybe Int -> IO ()
-runWatch opts mname mto = do
+runWatch :: Global -> Maybe String -> Maybe Int -> Maybe String -> Maybe String -> Bool -> IO ()
+runWatch opts mname mto mfilter msince loopMode = do
   name <- resolveName opts mname
   dir <- channelDir opts
   joinCursor <- requireCursor opts name
@@ -621,11 +662,37 @@ runWatch opts mname mto = do
   exists <- doesFileExist wc
   unless exists $ initWatchCursor dir joinCursor wc
   let timeout = fromMaybe 86400 mto
-  let loop = do
-        exit <- Bus.wait dir wc timeout ("[" <> name <> "] ")
+      -- Build the combined filter from --filter, --since, and self-exclude.
+      selfExclude line =
+        not $ (T.pack ("[" <> name <> "] ") `T.isPrefixOf` line)
+           || (T.pack ("] " <> name <> ": ") `T.isInfixOf` line)
+      regexFilter = case mfilter of
+        Nothing -> const True
+        Just pat -> \line ->
+          let r = T.pack pat
+           in r `T.isInfixOf` line
+  cutoffText <- case msince of
+    Nothing -> pure Nothing
+    Just dur -> case parseDuration dur of
+      Nothing -> pure Nothing
+      Just secs -> Just . T.pack <$> formatBefore secs
+  let sinceFilter = case cutoffText of
+        Nothing -> const True
+        Just cutoff -> \line ->
+          case T.stripPrefix "[" line of
+            Nothing -> True
+            Just rest ->
+              case T.breakOn "]" rest of
+                (ts, _) -> T.null ts || ts >= cutoff
+      combined line = selfExclude line && regexFilter line && sinceFilter line
+      loop = do
+        exit <- Bus.wait dir wc timeout combined
         case exit of
-          ExitSuccess -> loop
-          ExitFailure 2 -> pure () -- timeout expired
+          ExitSuccess | loopMode -> loop
+          ExitSuccess -> pure ()
+          ExitFailure 2
+            | loopMode -> loop -- timeout: restart the watch
+            | otherwise -> pure ()
           e -> exitWith e
   loop
 
@@ -1260,7 +1327,7 @@ main = do
     CmdLeave name -> runLeave opts name
     CmdPost args -> runPost opts args
     CmdRead mname mtail allFlag -> runRead opts mname mtail allFlag
-    CmdWatch mname mto -> runWatch opts mname mto
+    CmdWatch mname mto mfilter msince loopMode -> runWatch opts mname mto mfilter msince loopMode
     CmdNames -> runNames opts
     CmdLog -> runLog opts
     CmdChannels -> runChannels opts

@@ -15,6 +15,7 @@ module Muster.Channel
     channelClose,
     channelSend,
     channelRecv,
+    channelRecvRaw,
     channelRecvBlocking,
     defaultChannelConfig,
   )
@@ -29,9 +30,9 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Muster.Bus qualified as Bus
 import Muster.Cursor qualified as Cur
-import Muster.Framing (frameMessage, parseMessage)
+import Muster.Framing (formatNow, frameMessage, parseMessage)
 import System.Directory (doesFileExist)
-import System.Environment (getEnv, lookupEnv)
+import System.Environment (getEnv)
 import System.FilePath ((</>))
 import System.IO
   ( BufferMode (NoBuffering),
@@ -67,7 +68,7 @@ defaultChannelConfig :: Text -> ChannelConfig
 defaultChannelConfig name =
   ChannelConfig
     { chName = name,
-      chChannel = "general",
+      chChannel = "bus",
       chBusRoot = ""
     }
 
@@ -75,11 +76,7 @@ defaultChannelConfig name =
 resolveRoot :: FilePath -> IO FilePath
 resolveRoot explicit
   | not (null explicit) = pure explicit
-  | otherwise = do
-      menv <- lookupEnv "MUSTER_ROOT"
-      case menv of
-        Just d | not (null d) -> pure d
-        _ -> (</> "mg/logs/muster") <$> getEnv "HOME"
+  | otherwise = (</> ".config/muster") <$> getEnv "HOME"
 
 -- | Directory for a specific channel.
 channelDir :: ChannelConfig -> IO FilePath
@@ -142,19 +139,33 @@ channelClose ch = do
 -- | Send a framed message to the channel.
 channelSend :: Channel -> Text -> IO ()
 channelSend ch body = do
-  TIO.hPutStrLn (chWriteH ch) (frameMessage (chName (chCfg ch)) body)
+  ts <- formatNow
+  TIO.hPutStrLn (chWriteH ch) (frameMessage ts (chName (chCfg ch)) body)
   hFlush (chWriteH ch)
 
 -- | Receive all new messages since the last poll.
 --
 -- Returns @(sender, body)@ pairs. Lines that do not parse as framed messages
--- are silently dropped.
+-- are silently dropped. The optional timestamp is discarded — use the raw
+-- log if you need it.
 channelRecv :: Channel -> IO [(Text, Text)]
 channelRecv ch = do
   dir <- channelDir (chCfg ch)
   let logPath = Bus.busLog (Bus.pathsFor dir)
   ls <- Cur.pollFile (chCursor ch) logPath
-  pure $ mapMaybe parseMessage ls
+  pure $ mapMaybe (fmap dropTs . parseMessage) ls
+  where
+    dropTs (s, b, _) = (s, b)
+
+-- | Receive all new raw log lines since the last poll.
+--
+-- Returns the complete framed lines (including timestamps). Use this when
+-- you need the original log format rather than parsed sender/body pairs.
+channelRecvRaw :: Channel -> IO [Text]
+channelRecvRaw ch = do
+  dir <- channelDir (chCfg ch)
+  let logPath = Bus.busLog (Bus.pathsFor dir)
+  Cur.pollFile (chCursor ch) logPath
 
 -- | Block until new messages arrive, or the timeout fires.
 channelRecvBlocking :: Channel -> Int -> IO (Maybe [(Text, Text)])
