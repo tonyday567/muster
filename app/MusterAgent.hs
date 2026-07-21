@@ -312,7 +312,10 @@ startAlert :: MusterAgentConfig -> String -> IO (Handle, ProcessHandle)
 startAlert cfg channel = do
   -- The filter "[" matches every framed bus line. The watcher exits on
   -- the first new message, the agent wakes up and re-arms it.
-  let args = ["-c", channel, "[", maName cfg]
+  let rootArgs = case maBusRoot cfg of
+        "" -> []
+        r -> ["-r", r]
+      args = ["-c", channel] ++ rootArgs ++ ["[", maName cfg]
   res <- try @SomeException $
     createProcess
       (proc "muster-alert" args)
