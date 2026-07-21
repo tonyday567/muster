@@ -22,7 +22,7 @@
       font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, "Apple Color Emoji", "Segoe UI Emoji", monospace;
       height: 100vh;
       display: grid;
-      grid-template-columns: minmax(180px, 240px) 1fr;
+      grid-template-columns: 1fr;
       grid-template-rows: auto 1fr auto;
       gap: 0.4rem;
       padding: 0.4rem;
@@ -41,50 +41,6 @@
     #status { color: var(--muted); }
     #status.ok { color: var(--live); }
     #status.bad { color: var(--link); }
-    aside {
-      grid-row: 2;
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-      min-height: 0;
-    }
-    .panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.5rem 0.6rem;
-      overflow: auto;
-      min-height: 0;
-    }
-    .panel h2 {
-      font-size: 0.75rem;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      margin-bottom: 0.4rem;
-    }
-    #projects { flex: 0 0 auto; }
-    #agents { flex: 0 0 auto; }
-    #busPanel { flex: 0 0 auto; }
-    #busPanel .bus-name { color: var(--accent); margin-right: 0.6rem; }
-    .proj, .agent {
-      padding: 0.25rem 0;
-      border-bottom: 1px solid var(--border);
-      font-size: 0.82rem;
-    }
-    .proj:last-child, .agent:last-child { border-bottom: none; }
-    .proj a { color: var(--link); text-decoration: none; }
-    .proj a:hover { text-decoration: underline; }
-    .agent .name { color: var(--heading, var(--text)); font-weight: 600; }
-    .agent .meta { color: var(--muted); font-size: 0.75rem; }
-    .agent .last {
-      color: var(--text);
-      opacity: 0.85;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      max-width: 100%;
-    }
     .dot { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.35rem; }
     .dot.alive { background: var(--live); }
     .dot.stale { background: var(--warn); }
@@ -96,12 +52,6 @@
       padding: 0.1rem 0.4rem;
       border-radius: 4px;
       margin-right: 0.4rem;
-    }
-    main {
-      grid-row: 2;
-      display: flex;
-      flex-direction: column;
-      min-height: 0;
     }
     #log {
       flex: 1;
@@ -154,23 +104,7 @@
     <span id="status" class="dot down" title="connecting"></span>
     <button type="button" id="reconnect">reconnect</button>
   </header>
-  <aside>
-    <div class="panel" id="projects">
-      <h2>board</h2>
-      <div id="projList" class="muted">loading…</div>
-    </div>
-    <div class="panel" id="agents">
-      <h2>agents</h2>
-      <div id="agentList">loading…</div>
-    </div>
-    <div class="panel" id="busPanel">
-      <h2>bus</h2>
-      <div id="busBar"></div>
-    </div>
-  </aside>
-  <main>
-    <div id="log"></div>
-  </main>
+  <main id="log">connecting…</main>
   <form id="compose">
     <textarea id="msg" placeholder="type → bus (⌘/Ctrl+Enter) · @name for agents"></textarea>
     <div class="row">
@@ -181,13 +115,10 @@
     const logEl = document.getElementById('log');
     const statusEl = document.getElementById('status');
     const msgEl = document.getElementById('msg');
-    const projList = document.getElementById('projList');
-    const agentList = document.getElementById('agentList');
     const channelBadge = document.getElementById('channelBadge');
     const identityBadge = document.getElementById('identityBadge');
     let ws;
     let backoff = 2000;
-    let lastStateJson = '';
     let intentionalClose = false;
 
     function defaultWsUrl() {
@@ -205,7 +136,8 @@
       const stick = nearBottom(logEl);
       const d = document.createElement('div');
       d.className = 'line';
-      d.textContent = line;
+      // strip [timestamp] prefix for display
+      d.textContent = line.replace(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\]\s*/, '');
       logEl.appendChild(d);
       if (stick) logEl.scrollTop = logEl.scrollHeight;
     }
@@ -217,67 +149,6 @@
     function setStatus(cls, title) {
       statusEl.className = 'dot ' + (cls || 'down');
       statusEl.title = title || '';
-    }
-
-    function linkifyProject(line) {
-      // [name](path) markdown links — show only the linked name
-      const m = line.match(/\[([^\]]+)\]\(([^)]+)\)/);
-      if (!m) return escapeHtml(line);
-      return `<a href="#" title="${escapeHtml(m[2])}" data-path="${escapeHtml(m[2])}">⧈ ${escapeHtml(m[1])}</a>`;
-    }
-
-    function escapeHtml(s) {
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    }
-
-    function renderState(st) {
-      if (st.projects && st.projects.length) {
-        projList.innerHTML = st.projects.map(p =>
-          `<div class="proj">${linkifyProject(p)}</div>`
-        ).join('');
-      } else if (st.board) {
-        projList.innerHTML = `<pre style="white-space:pre-wrap;font:inherit;margin:0">${escapeHtml(st.board)}</pre>`;
-      } else {
-        projList.textContent = '(no board lines)';
-      }
-      if (st.agents && st.agents.length) {
-        const names = new Set(st.agents.map(a => a.name));
-        // merge bus participants not already in agent list
-        const extra = (st.bus || []).filter(n => !names.has(n)).map(n => ({name: n, status: 'stale'}));
-        const all = [...st.agents, ...extra];
-        agentList.innerHTML = all.map(a =>
-          `<div class="agent"><span class="dot ${escapeHtml(a.status)}"></span><span class="name">${escapeHtml(a.name)}</span></div>`
-        ).join('');
-      } else {
-        agentList.textContent = '(no agents/)';
-      }
-      // bus status bar
-      const busBar = document.getElementById('busBar');
-      if (busBar && st.bus && st.bus.length) {
-        busBar.innerHTML = st.bus.map(n =>
-          `<span class="bus-name">@${escapeHtml(n)}</span>`
-        ).join('');
-      }
-      // channel + identity badges
-      if (st.channel) channelBadge.textContent = '#' + st.channel;
-      if (st.identity) identityBadge.textContent = '@' + st.identity;
-    }
-
-    async function refreshState() {
-      try {
-        const r = await fetch('/api/state', { cache: 'no-store' });
-        if (!r.ok) throw new Error(r.status);
-        const text = await r.text();
-        // skip DOM thrash when nothing changed
-        if (text === lastStateJson) return;
-        lastStateJson = text;
-        const st = JSON.parse(text);
-        renderState(st);
-      } catch (e) {
-        if (projList.textContent !== 'state fetch failed') {
-          projList.textContent = 'state fetch failed';
-        }
-      }
     }
 
     function connect() {
@@ -293,7 +164,6 @@
         backoff = 2000;
         // server re-sends history on connect — clear first to avoid dups + scroll fight
         clearLog();
-        refreshState();
       };
       ws.onclose = () => {
         setStatus('stale', 'reconnecting');
@@ -327,18 +197,7 @@
       connect();
     };
 
-    projList.addEventListener('click', (e) => {
-      const a = e.target.closest('a[data-path]');
-      if (!a) return;
-      e.preventDefault();
-      const path = a.dataset.path;
-      // open file on server via /api/open
-      fetch('/api/open?path=' + encodeURIComponent(path)).catch(() => {});
-    });
-
     connect();
-    // sidebar only; 15s + skip-if-unchanged avoids thrash
-    setInterval(refreshState, 15000);
   </script>
 </body>
 </html>
