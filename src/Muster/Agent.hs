@@ -13,12 +13,16 @@ module Muster.Agent
   )
 where
 
+import Control.Exception (SomeException, try)
 import Control.Monad (when)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Environment (lookupEnv)
+import Data.Text.IO qualified as TIO
+import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Environment (getEnv, lookupEnv)
 import System.Exit (ExitCode (..))
+import System.FilePath (takeDirectory, (</>))
 import System.Process (readCreateProcessWithExitCode, shell)
 import Prelude
 
@@ -89,15 +93,17 @@ stripAddress name body =
 
 -- | Run the configured oneshot agent command against a prompt.
 --
--- Invoked as @\<agent\> chat -q \<prompt\>@, attempting session continuation
--- first and falling back to a fresh session.
+-- Invoked as @\<agent\> chat -q \<prompt\>@.  The first call creates a Hermes
+-- session; subsequent calls resume it by session id so context persists across
+-- dispatches.  If the stored session disappears, we fall back to a fresh
+-- session and record the new id.
 agentQuery :: AgentConfig -> Text -> IO Text
 agentQuery cfg prompt = do
   homeModel <- lookupEnv "HERMES_MODEL"
   homeProv <- lookupEnv "HERMES_PROVIDER"
+  sessionFile <- agentSessionFile cfg
   let model = fromMaybe (fromMaybe "deepseek-v4-pro" homeModel) (cfgModel cfg)
       provider = fromMaybe (fromMaybe "deepseek" homeProv) (cfgProvider cfg)
-      session = cfgName cfg <> "-session"
       q = shellQuote (T.unpack prompt)
       baseArgs =
         [ cfgAgent cfg <> " chat -q",
@@ -106,22 +112,70 @@ agentQuery cfg prompt = do
           "--provider", shellQuote provider,
           "--yolo -Q --max-turns 90"
         ]
-      continueArgs = baseArgs <> ["--continue", shellQuote session]
+      resumeArgs sid = baseArgs <> ["--resume", shellQuote sid]
       runAgent args = do
         let cmd = unwords ("export PATH=\"$HOME/.local/bin:$PATH\";" : args)
         (code, out, err) <- readCreateProcessWithExitCode (shell cmd) ""
         pure (code, T.pack out <> T.pack err)
-  (code1, out1) <- runAgent continueArgs
-  let missing =
-        "No session found matching" `T.isInfixOf` out1
-          || code1 /= ExitSuccess
-  if missing
-    then do
-      (code2, out2) <- runAgent baseArgs
-      when (code2 /= ExitSuccess) $
-        fail $ "agent failed (code " <> show code2 <> "): " <> T.unpack (T.take 200 out2)
-      pure $ cleanAgentOut out2
-    else pure $ cleanAgentOut out1
+  mSid <- readStoredSession sessionFile
+  case mSid of
+    Nothing -> runFresh sessionFile runAgent baseArgs
+    Just sid -> do
+      (code, out) <- runAgent (resumeArgs sid)
+      let stale =
+            code /= ExitSuccess
+              || "No session found matching" `T.isInfixOf` out
+              || "Session not found" `T.isInfixOf` out
+      if stale
+        then runFresh sessionFile runAgent baseArgs
+        else do
+          updateSessionFile sessionFile out
+          pure $ cleanAgentOut out
+
+runFresh :: FilePath -> ([String] -> IO (ExitCode, Text)) -> [String] -> IO Text
+runFresh sessionFile runAgent baseArgs = do
+  (code, out) <- runAgent baseArgs
+  when (code /= ExitSuccess) $
+    fail $ "agent failed (code " <> show code <> "): " <> T.unpack (T.take 200 out)
+  updateSessionFile sessionFile out
+  pure $ cleanAgentOut out
+
+updateSessionFile :: FilePath -> Text -> IO ()
+updateSessionFile path out =
+  case parseSessionId out of
+    Nothing -> pure ()
+    Just sid -> writeStoredSession path sid
+
+agentSessionFile :: AgentConfig -> IO FilePath
+agentSessionFile cfg = do
+  home <- getEnv "HOME"
+  pure (home </> ".config/muster" </> "agents" </> cfgName cfg </> "session")
+
+readStoredSession :: FilePath -> IO (Maybe String)
+readStoredSession path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      res <- try @SomeException (TIO.readFile path)
+      pure case res of
+        Left _ -> Nothing
+        Right t ->
+          let sid = T.unpack (T.strip t)
+           in if null sid then Nothing else Just sid
+
+writeStoredSession :: FilePath -> String -> IO ()
+writeStoredSession path sid = do
+  createDirectoryIfMissing True (takeDirectory path)
+  TIO.writeFile path (T.pack sid)
+
+parseSessionId :: Text -> Maybe String
+parseSessionId out =
+  case filter ("session_id:" `T.isPrefixOf`) (T.lines out) of
+    (line : _) ->
+      let sid = T.strip (T.drop (T.length "session_id:") line)
+       in if T.null sid then Nothing else Just (T.unpack sid)
+    _ -> Nothing
 
 shellQuote :: String -> String
 shellQuote s = "'" <> concatMap esc s <> "'"
