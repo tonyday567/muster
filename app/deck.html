@@ -19,13 +19,13 @@
     body {
       background: var(--bg);
       color: var(--text);
-      font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, "Apple Color Emoji", "Segoe UI Emoji", monospace;
+      font: 11px/1.35 ui-monospace, "SF Mono", Menlo, Consolas, "Apple Color Emoji", "Segoe UI Emoji", monospace;
       height: 100vh;
       display: grid;
       grid-template-columns: 1fr;
       grid-template-rows: auto 1fr auto;
-      gap: 0.4rem;
-      padding: 0.4rem;
+      gap: 0.35rem;
+      padding: 0.35rem;
     }
     header {
       grid-column: 1 / -1;
@@ -59,12 +59,33 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 0.55rem 0.7rem;
+      padding: 0.4rem 0.55rem;
       white-space: pre-wrap;
       word-break: break-word;
       min-height: 0;
     }
-    #log .line { margin: 0.12rem 0; }
+    #log .line { margin: 0.1rem 0; }
+    .msg {
+      display: flex;
+      align-items: baseline;
+      margin: 0.1rem 0;
+    }
+    .name {
+      flex: 0 0 auto;
+      min-width: 8ch;
+      max-width: 14ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-right: 0.75em;
+      font-weight: 600;
+    }
+    .body {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .body-line { display: block; }
+    .body-line.cont { margin-left: 0; }
     form {
       grid-column: 1 / -1;
       display: flex;
@@ -132,18 +153,74 @@
       return el.scrollHeight - el.scrollTop - el.clientHeight < (px || 48);
     }
 
+    const senderColors = {
+      deck: '#4B7FBD',
+      kimi: '#C44E8A',
+      hermes: '#3fa47e',
+      'mini-hermes': '#D98A3A',
+      stinky: '#9aa3b2',
+      testagent: '#9aa3b2'
+    };
+    function colorForSender(name) {
+      if (senderColors[name]) return senderColors[name];
+      let h = 0;
+      for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+      return 'hsl(' + h + ', 70%, 65%)';
+    }
+    let lastSender = null;
+    let lastBody = null;
+
     function append(line) {
       const stick = nearBottom(logEl);
-      const d = document.createElement('div');
-      d.className = 'line';
-      // strip [timestamp] prefix for display
-      d.textContent = line.replace(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\]\s*/, '');
-      logEl.appendChild(d);
+      // V2 frame: [timestamp] sender: body
+      const m = line.match(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\]\s+([^:]+):\s*(.*)$/);
+      if (!m) {
+        const d = document.createElement('div');
+        d.className = 'line';
+        d.textContent = line;
+        logEl.appendChild(d);
+        lastSender = null;
+        lastBody = null;
+        if (stick) logEl.scrollTop = logEl.scrollHeight;
+        return;
+      }
+      const sender = m[1];
+      const body = m[2];
+      if (sender === lastSender && lastBody) {
+        const cont = document.createElement('span');
+        cont.className = 'body-line cont';
+        cont.textContent = body;
+        lastBody.appendChild(cont);
+      } else {
+        const row = document.createElement('div');
+        row.className = 'msg';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'name';
+        nameEl.textContent = '[' + sender + ']';
+        nameEl.style.color = colorForSender(sender);
+        const bodyEl = document.createElement('span');
+        bodyEl.className = 'body';
+        const first = document.createElement('span');
+        first.className = 'body-line';
+        first.textContent = body;
+        bodyEl.appendChild(first);
+        row.appendChild(nameEl);
+        row.appendChild(bodyEl);
+        logEl.appendChild(row);
+        lastSender = sender;
+        lastBody = bodyEl;
+      }
       if (stick) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function resetSenderGrouping() {
+      lastSender = null;
+      lastBody = null;
     }
 
     function clearLog() {
       logEl.innerHTML = '';
+      resetSenderGrouping();
     }
 
     function setStatus(cls, title) {
