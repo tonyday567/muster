@@ -212,6 +212,7 @@ data Cmd
   | CmdPost [String]
   | CmdRead (Maybe String) (Maybe Int) Bool
   | CmdWatch (Maybe String) (Maybe Int) (Maybe String) (Maybe String) Bool
+  | CmdPing (Maybe String) (Maybe Int) (Maybe String) (Maybe String) Bool
   | CmdNames
   | CmdLog
   | CmdChannels
@@ -342,6 +343,7 @@ cmdParser =
               (progDesc "Read messages (NAME optional if MUSTER_NAME or sole cursor; default --tail 20)")
           )
         <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt <*> filterOpt <*> sinceOpt <*> loopOpt) (progDesc "Block until someone posts"))
+        <> command "ping" (info (CmdPing <$> optionalNameArg <*> timeoutOpt <*> filterOpt <*> sinceOpt <*> loopOpt) (progDesc "Callback ping: block until someone posts"))
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
         <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
         <> command "channels" (info (pure CmdChannels) (progDesc "List all channels with metadata"))
@@ -507,7 +509,7 @@ optionsParser =
     (Options <$> globalParser <*> cmdParser <**> helper)
     ( fullDesc
         <> progDesc "muster: IRC-shaped shells for named coordination channels"
-        <> header "muster — join, post, read, watch"
+        <> header "muster — join, post, read, ping"
     )
 
 -- ---------------------------------------------------------------------------
@@ -1351,6 +1353,7 @@ main = do
     CmdPost args -> runPost opts args
     CmdRead mname mtail allFlag -> runRead opts mname mtail allFlag
     CmdWatch mname mto mfilter msince loopMode -> runWatch opts mname mto mfilter msince loopMode
+    CmdPing mname mto mfilter msince loopMode -> runWatch opts mname mto mfilter msince loopMode
     CmdNames -> runNames opts
     CmdLog -> runLog opts
     CmdChannels -> runChannels opts

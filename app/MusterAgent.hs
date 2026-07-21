@@ -310,7 +310,9 @@ alertWatcher cfg wakeQueue channel = forever $ do
 
 startAlert :: MusterAgentConfig -> String -> IO (Handle, ProcessHandle)
 startAlert cfg channel = do
-  let args = ["-c", channel, "-l", "[", maName cfg]
+  -- The filter "[" matches every framed bus line. The watcher exits on
+  -- the first new message, the agent wakes up and re-arms it.
+  let args = ["-c", channel, "[", maName cfg]
   res <- try @SomeException $
     createProcess
       (proc "muster-alert" args)

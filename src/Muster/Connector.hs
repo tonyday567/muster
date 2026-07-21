@@ -27,8 +27,9 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Muster.Agent (addressedTo, stripAddress)
 import Muster.Channel (Channel, ChannelConfig (..), channelAttach, channelClose, channelRecv, channelSend, defaultChannelConfig)
-import System.Directory (createDirectoryIfMissing, getHomeDirectory, removePathForcibly)
-import System.FilePath ((</>), takeBaseName)
+import Muster.Config qualified as Config
+import System.Directory (removePathForcibly)
+import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import Prelude
 
@@ -75,9 +76,8 @@ runConnector cfg = do
             chBusRoot = connBusRoot cfg
           }
   ch <- channelAttach chanCfg
-  dir <- sessionDir cfg
+  dir <- Config.connectorSessionDir (connName cfg) (connChannel cfg) (connProject cfg)
   removePathForcibly dir
-  createDirectoryIfMissing True dir
   let replCfg =
         defaultReplConfig
           { replCommand = connCommand cfg,
@@ -180,8 +180,3 @@ emitOutUntil p t pp = go 0 [] 10000
               let delay' = min 500000 (floor (fromIntegral delay * 1.5 :: Double))
               go elapsed' acc' delay'
 
-sessionDir :: ConnectorConfig -> IO FilePath
-sessionDir cfg = do
-  home <- getHomeDirectory
-  let session = takeBaseName (connProject cfg) <> "-" <> connChannel cfg <> "-" <> T.unpack (connName cfg)
-  pure $ home </> "mg" </> "logs" </> "process-harness" </> "connector" </> session

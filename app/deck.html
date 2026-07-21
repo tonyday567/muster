@@ -171,7 +171,7 @@
 
     function append(line) {
       const stick = nearBottom(logEl);
-      // V2 frame: [timestamp] sender: body
+      // Frame: [timestamp] sender: body
       const m = line.match(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\]\s+([^:]+):\s*(.*)$/);
       if (!m) {
         const d = document.createElement('div');

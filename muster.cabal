@@ -62,6 +62,7 @@ library
     exposed-modules:
         Muster.Bus
         Muster.Channel
+        Muster.Config
         Muster.Cursor
         Muster.Framing
         Muster.Agent
@@ -186,10 +187,10 @@ executable muster-alert
 
     build-depends:
         base,
+        muster,
         text,
         directory,
         filepath,
-        process,
         unix
 
     hs-source-dirs:   app

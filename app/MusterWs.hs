@@ -21,6 +21,7 @@ import Muster.Channel
     channelSend,
     defaultChannelConfig,
   )
+import Muster.Framing qualified as Framing
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitEither)
 import Control.Concurrent.STM
@@ -83,7 +84,7 @@ optsP =
   Opts
     <$> strOption (long "name" <> short 'n' <> value "desk" <> showDefault <> help "Bus identity")
     <*> strOption (long "channel" <> short 'c' <> value "bus" <> showDefault)
-    <*> strOption (long "bus-root" <> value "" <> help "Default: $HOME/mg/logs/muster")
+    <*> strOption (long "bus-root" <> value "" <> help "Default: $HOME/.config/muster")
     <*> strOption (long "host" <> value "127.0.0.1" <> showDefault)
     <*> option auto (long "port" <> short 'p' <> value 9162 <> showDefault)
     <*> option auto (long "history" <> value 80 <> showDefault <> help "Log lines on WS connect")
@@ -372,18 +373,10 @@ lastLinesBySender path n = do
       raw <- TIO.readFile path
       let ls = reverse $ take n $ reverse $ filter (not . T.null) $ T.lines raw
           step m line =
-            case parseSender line of
+            case Framing.parseMessage line of
               Nothing -> m
-              Just s -> Map.insert s line m
+              Just (sender, _) -> Map.insert sender line m
       pure $ foldl' step Map.empty ls
-
-parseSender :: Text -> Maybe Text
-parseSender t =
-  case T.stripPrefix "[" t of
-    Nothing -> Nothing
-    Just rest ->
-      let (s, _) = T.breakOn "]" rest
-       in if T.null s then Nothing else Just s
 
 projectLines :: Text -> [Text]
 projectLines board =

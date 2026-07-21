@@ -19,8 +19,9 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Muster.Config qualified as Config
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.Environment (getEnv, lookupEnv)
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.Process (readCreateProcessWithExitCode, shell)
@@ -148,8 +149,8 @@ updateSessionFile path out =
 
 agentSessionFile :: AgentConfig -> IO FilePath
 agentSessionFile cfg = do
-  home <- getEnv "HOME"
-  pure (home </> ".config/muster" </> "agents" </> cfgName cfg </> "session")
+  dir <- Config.agentSessionDir (cfgName cfg)
+  pure (dir </> "session")
 
 readStoredSession :: FilePath -> IO (Maybe String)
 readStoredSession path = do
