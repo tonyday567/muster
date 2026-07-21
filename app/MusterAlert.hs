@@ -111,10 +111,14 @@ runAlert cfg = do
   where
     start c =
       createProcess
-        (proc "muster" ["-c", cfgChannel c, "watch", cfgName c])
+        (proc "muster" args)
           { std_out = CreatePipe,
             std_err = Inherit
           }
+      where
+        args =
+          ["-c", cfgChannel c, "watch", cfgName cfg]
+            <> if cfgLoop cfg then ["--loop"] else []
 
     loop h ph = do
       done <- getProcessExitCode ph

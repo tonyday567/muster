@@ -24,8 +24,9 @@
 -- @
 module Main (main) where
 
-import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, try)
+import Control.Concurrent (Chan, newChan, readChan, threadDelay, writeChan)
+import Control.Concurrent.Async (Async, async, cancel)
+import Control.Exception (SomeException, bracket, try)
 import Control.Monad (foldM, forever, unless, void, when)
 import Data.List (sort)
 import Data.Maybe (fromMaybe)
@@ -43,9 +44,26 @@ import System.Directory (doesDirectoryExist, doesFileExist, getHomeDirectory, li
 import System.Environment (getEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
-import Data.IORef (newIORef, readIORef, writeIORef)
-import System.IO (stderr)
-import System.Process (createProcess, proc, waitForProcess)
+import System.IO
+  ( BufferMode (..),
+    Handle,
+    hClose,
+    hGetLine,
+    hIsEOF,
+    hSetBuffering,
+    hSetEncoding,
+    stderr,
+    utf8,
+  )
+import System.Process
+  ( CreateProcess (..),
+    ProcessHandle,
+    StdStream (..),
+    createProcess,
+    proc,
+    terminateProcess,
+    waitForProcess,
+  )
 import Prelude
 
 -- ---------------------------------------------------------------------------
@@ -211,16 +229,21 @@ main = do
 runOneShot :: MusterAgentConfig -> IO ()
 runOneShot cfg = do
   let agentCfg = toAgentConfig cfg
-  channelsRef <- newIORef Map.empty
+  wakeQueue <- newChan
   logErr "scanning for joined channels..."
-  forever do
-    channels <- readIORef channelsRef
-    newChannels <- refreshChannels cfg channels
-    writeIORef channelsRef newChannels
-    msgs <- pollAll newChannels
-    if null msgs
-      then threadDelay 500_000
-      else mapM_ (handleMessage agentCfg cfg) msgs
+  let go :: Map String Channel -> Map String (Async ()) -> IO ()
+      go channels watchers = do
+        newChannels <- refreshChannels cfg channels
+        newWatchers <- refreshWatchers cfg wakeQueue watchers newChannels
+        channelName <- readChan wakeQueue
+        case Map.lookup channelName newChannels of
+          Nothing -> go newChannels newWatchers
+          Just ch -> do
+            msgs <- channelRecv ch
+            unless (null msgs) $
+              mapM_ (\(s, b) -> handleMessage agentCfg cfg (channelName, s, b)) msgs
+            go newChannels newWatchers
+  go Map.empty Map.empty
 
 -- | Refresh the set of attached channels.  Returns a map from channel name to
 -- open handle, attaching to any newly-joined channels and dropping any whose
@@ -251,11 +274,60 @@ refreshChannels cfg old = do
     logErr $ "  left channels: " <> unwords (Set.toList stale)
   pure (foldr Map.delete added (Set.toList stale))
 
--- | Poll every attached channel and collect messages tagged with their origin.
-pollAll :: Map String Channel -> IO [(String, Text, Text)]
-pollAll channels = do
-  results <- mapM (\(name, ch) -> fmap (map (\(s, b) -> (name, s, b))) (channelRecv ch)) (Map.toList channels)
-  pure (concat results)
+-- | Start alert watchers for newly-joined channels and cancel watchers for
+-- channels that have been left.  Each watcher runs @muster-alert -c <channel>
+-- -l "[" <name>@ in a loop, signalling the main thread on every post.
+refreshWatchers ::
+  MusterAgentConfig ->
+  Chan String ->
+  Map String (Async ()) ->
+  Map String Channel ->
+  IO (Map String (Async ()))
+refreshWatchers cfg wakeQueue old channels = do
+  let current = Set.fromList (Map.keys channels)
+      stale = Map.keysSet old `Set.difference` current
+      newNames = Set.toList (current `Set.difference` Map.keysSet old)
+  mapM_ cancel (Map.elems (Map.filterWithKey (\k _ -> Set.member k stale) old))
+  added <- mapM (\name -> (name,) <$> async (alertWatcher cfg wakeQueue name)) newNames
+  pure $ Map.union (Map.difference old (Map.fromSet (const ()) stale)) (Map.fromList added)
+
+alertWatcher :: MusterAgentConfig -> Chan String -> String -> IO ()
+alertWatcher cfg wakeQueue channel = forever $ do
+  res <- try @SomeException $
+    bracket (startAlert cfg channel) stopAlert $ \(h, _) -> do
+      hSetBuffering h LineBuffering
+      hSetEncoding h utf8
+      forever $ do
+        eof <- hIsEOF h
+        when eof $ fail "alert stdout closed"
+        _ <- hGetLine h
+        writeChan wakeQueue channel
+  case res of
+    Left err -> do
+      logErr $ "  watcher for #" <> channel <> " died: " <> show err
+      threadDelay 1_000_000
+    Right _ -> pure ()
+
+startAlert :: MusterAgentConfig -> String -> IO (Handle, ProcessHandle)
+startAlert cfg channel = do
+  let args = ["-c", channel, "-l", "[", maName cfg]
+  res <- try @SomeException $
+    createProcess
+      (proc "muster-alert" args)
+        { std_out = CreatePipe,
+          std_err = Inherit
+        }
+  case res of
+    Left err -> fail $ "failed to start muster-alert: " <> show err
+    Right (Nothing, Just h, Nothing, ph) -> pure (h, ph)
+    Right _ -> fail "muster-alert: unexpected process streams"
+
+stopAlert :: (Handle, ProcessHandle) -> IO ()
+stopAlert (h, ph) = do
+  void $ try @SomeException $ hClose h
+  void $ try @SomeException $ terminateProcess ph
+  void $ try @SomeException $ waitForProcess ph
+  pure ()
 
 runPersistent :: MusterAgentConfig -> IO ()
 runPersistent cfg = do

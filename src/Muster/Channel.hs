@@ -104,15 +104,25 @@ openHandles cfg dir ownsBus = do
   let p = Bus.pathsFor dir
       logPath = Bus.busLog p
       fifoPath = Bus.busFifo p
+      cursorFile = dir </> ".cursor-" <> T.unpack (chName cfg)
   fifoExists <- doesFileExist fifoPath
   unless fifoExists $
     fail $ "bus.fifo missing at " <> fifoPath <> " — run: muster bus start -c " <> chChannel cfg
-  cursor <- Cur.newMem 0
-  content <-
-    doesFileExist logPath >>= \case
-      True -> TIO.readFile logPath
-      False -> pure ""
-  Cur.seekEnd cursor (completeLines content)
+  -- Use the persistent participant cursor when it exists so that external
+  -- watchers such as muster-alert/muster-watch see the same read position.
+  -- Otherwise start an in-memory cursor at the current end of the log.
+  cursorExists <- doesFileExist cursorFile
+  cursor <-
+    if cursorExists
+      then Cur.newFile cursorFile
+      else do
+        c <- Cur.newMem 0
+        content <-
+          doesFileExist logPath >>= \case
+            True -> TIO.readFile logPath
+            False -> pure ""
+        Cur.seekEnd c (completeLines content)
+        pure c
   writeH <-
     openFile fifoPath WriteMode
       `onException` unless ownsBus (pure ())

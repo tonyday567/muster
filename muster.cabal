@@ -120,6 +120,7 @@ executable muster-agent
         muster,
         optparse-applicative,
         text,
+        async,
         containers,
         directory,
         filepath,
