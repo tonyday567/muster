@@ -1,9 +1,10 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | One-shot (or looping) muster watcher.
 --
--- Spawns @muster watch NAME@, waits for a bus line beginning with PREFIX,
+-- Spawns @muster watch NAME@, waits for a bus line from a specific sender,
 -- prints that line, and exits.  With @--loop@ it re-arms after each match
 -- and keeps watching until SIGTERM.
 --
@@ -11,14 +12,19 @@
 -- turn-based Hermes sessions to get a @notify_on_complete@ ping when a
 -- specific participant posts.
 --
--- Usage: @muster-alert [-c <channel>] [-l|--loop] <prefix> <name>@
--- Example: @muster-alert "[desk]" hermes@
--- Example: @muster-alert -c dev --loop "[desk]" hermes@
+-- Matches the sender in V2 frames @[timestamp] sender: body@.  For backward
+-- compat, a prefix of the form @[name]@ is treated as @name@.
+--
+-- Usage: @muster-alert [-c <channel>] [-l|--loop] <sender> <name>@
+-- Example: @muster-alert "desk" hermes@
+-- Example: @muster-alert -c dev --loop "desk" hermes@
 module Main (main) where
 
 import Control.Exception (IOException, bracket, try)
 import Control.Monad (void, when)
-import Data.List (isPrefixOf)
+import Data.Maybe (fromMaybe)
+import Data.Text (Text)
+import Data.Text qualified as T
 import System.Directory (doesFileExist, removeFile)
 import System.Environment (getArgs, getEnv)
 import System.Exit (exitFailure, exitSuccess)
@@ -66,10 +72,10 @@ main = do
 
 usage :: IO ()
 usage = do
-  putStrLn "Usage: muster-alert [-c <channel>] [-l|--loop] <prefix> <name>"
+  putStrLn "Usage: muster-alert [-c <channel>] [-l|--loop] <sender> <name>"
   putStrLn "  -c        channel (default: bus)"
   putStrLn "  -l, --loop  continuous mode: re-arm after each match"
-  putStrLn "  prefix:   line prefix to match, e.g. '[desk]'"
+  putStrLn "  sender:   sender name to match, e.g. 'desk' (or '[desk]' for back-compat)"
   putStrLn "  name:     watcher name passed to 'muster watch'"
   exitFailure
 
@@ -120,7 +126,7 @@ runAlert cfg = do
             then pure False
             else do
               line <- hGetLine h
-              if cfgPrefix cfg `isPrefixOf` line
+              if senderMatches cfg line
                 then do
                   putStrLn line
                   hFlush stdout
@@ -128,6 +134,36 @@ runAlert cfg = do
                     then loop h ph
                     else pure True
                 else loop h ph
+
+-- | Match the configured sender against a V2-framed bus line.
+--
+-- V2 format: @[timestamp] sender: body@.  For convenience, a prefix
+-- wrapped in brackets like @[desk]@ is normalised to @desk@.
+senderMatches :: Config -> String -> Bool
+senderMatches cfg line =
+  case parseSender (T.pack line) of
+    Nothing -> False
+    Just sender -> normalise (cfgPrefix cfg) `T.isInfixOf` sender
+  where
+    normalise p =
+      let t = T.pack p
+          noOpen = fromMaybe t (T.stripPrefix "[" t)
+          noClose = fromMaybe noOpen (T.stripSuffix "]" noOpen)
+       in noClose
+
+-- | Parse the sender from a V2 frame @[timestamp] sender: body@.
+parseSender :: Text -> Maybe Text
+parseSender t =
+  case T.stripPrefix "[" t of
+    Nothing -> Nothing
+    Just rest ->
+      case T.breakOn "] " rest of
+        (_, "") -> Nothing
+        (_, afterBracket) ->
+          let after = T.drop 2 afterBracket
+           in case T.breakOn ": " after of
+                ("", _) -> Nothing
+                (sender, _) -> Just sender
 
 resolveRoot :: IO FilePath
 resolveRoot = (</> ".config/muster") <$> getEnv "HOME"

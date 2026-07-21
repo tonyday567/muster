@@ -180,7 +180,9 @@ serveHtml respond =
   respond $
     responseLBS
       status200
-      [("Content-Type", "text/html; charset=utf-8")]
+      [ ("Content-Type", "text/html; charset=utf-8"),
+        ("Cache-Control", "no-store, no-cache, must-revalidate")
+      ]
       deckHtml
 
 buildStateJson :: FilePath -> FilePath -> FilePath -> Text -> Text -> IO Text
