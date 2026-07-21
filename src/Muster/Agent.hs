@@ -199,4 +199,24 @@ cleanAgentOut =
       | "Requesting summary" `T.isInfixOf` l = False
       | "No session found matching" `T.isInfixOf` l = False
       | "Use 'hermes sessions list'" `T.isInfixOf` l = False
+      | "Resume this session with:" `T.isInfixOf` l = False
+      | "Shutting down" `T.isInfixOf` l = False
+      | "Session:" `T.isPrefixOf` l = False
+      | "Duration:" `T.isPrefixOf` l = False
+      | "Messages:" `T.isPrefixOf` l = False
+      | "⚕" `T.isPrefixOf` l = False
+      | "❯" `T.isPrefixOf` l = False
+      | T.any (== '\x1b') l = False
+      | isDecorative l = False
       | otherwise = True
+    isDecorative t =
+      let ok c =
+            c == ' '
+              || c == '\r'
+              || c == '─'
+              || c == '│'
+              || c == '┌'
+              || c == '┐'
+              || c == '└'
+              || c == '┘'
+       in T.all ok t
