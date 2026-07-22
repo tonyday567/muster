@@ -186,7 +186,7 @@ formatBefore secs = do
 data BusCmd = BusStart | BusStop | BusStatus | BusDaemon deriving (Show, Eq)
 
 data AgentCmd
-  = AgentNew String (Maybe String) (Maybe String) (Maybe String)
+  = AgentNew String (Maybe String) (Maybe String) (Maybe String) (Maybe String)
   | AgentStop String
   | AgentStatus (Maybe String)
   | AgentList
@@ -417,6 +417,16 @@ agentProviderOpt =
           <> help "Hermes provider (default: deepseek or HERMES_PROVIDER)"
       )
 
+agentFilterOpt :: Parser (Maybe String)
+agentFilterOpt =
+  optional $
+    strOption
+      ( long "filter"
+          <> short 'f'
+          <> metavar "REGEX"
+          <> help "Alert filter regex (default: @<name>)"
+      )
+
 agentCmdParser :: Parser AgentCmd
 agentCmdParser =
   hsubparser
@@ -428,6 +438,7 @@ agentCmdParser =
                 <*> agentCmdOpt
                 <*> agentModelOpt
                 <*> agentProviderOpt
+                <*> agentFilterOpt
             )
             (progDesc "Start muster-agent for NAME")
         )
@@ -1113,8 +1124,8 @@ killPid pid = void $ do
   waitForProcess ph
 
 -- | Start the long-lived Haskell agent bridge.
-runAgentNew :: Global -> String -> Maybe String -> Maybe String -> Maybe String -> IO ()
-runAgentNew opts name mAgent mModel mProvider = do
+runAgentNew :: Global -> String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> IO ()
+runAgentNew opts name mAgent mModel mProvider mFilter = do
   validateName name
   -- Agents are symmetric to humans: `muster agent new` creates the agent
   -- state but does NOT join any channel.  The operator joins the agent to
@@ -1137,6 +1148,7 @@ runAgentNew opts name mAgent mModel mProvider = do
   let agentCmd = fromMaybe "hermes" mAgent
       model = fromMaybe (fromMaybe "deepseek-v4-pro" homeModel) mModel
       provider = fromMaybe (fromMaybe "deepseek" homeProv) mProvider
+      filterArg = maybe [] (\f -> ["--filter", f]) mFilter
   writeFile cfgPath $
     unlines
       [ "name=" <> name,
@@ -1154,6 +1166,7 @@ runAgentNew opts name mAgent mModel mProvider = do
           <> ["--agent", agentCmd]
           <> ["--model", model]
           <> ["--provider", provider]
+          <> filterArg
       sh =
         "nohup muster-agent "
           <> unwords (map show args)
@@ -1245,7 +1258,7 @@ runAgentList opts = do
 
 runAgent :: Global -> AgentCmd -> IO ()
 runAgent opts = \case
-  AgentNew name mAgent mModel mProvider -> runAgentNew opts name mAgent mModel mProvider
+  AgentNew name mAgent mModel mProvider mFilter -> runAgentNew opts name mAgent mModel mProvider mFilter
   AgentStop name -> runAgentStop opts name
   AgentStatus Nothing -> runAgentList opts
   AgentStatus (Just name) -> runAgentStatusOne opts name

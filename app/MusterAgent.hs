@@ -37,10 +37,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Muster.Agent (AgentConfig (..), AgentMode (..), addressedTo, agentQuery, defaultAgentConfig, stripAddress)
-import Muster.Channel (Channel, ChannelConfig (..), channelAttach, channelRecv, channelSend, defaultChannelConfig)
+import Muster.Channel (Channel, ChannelConfig (..), channelAttach, channelRecv, defaultChannelConfig)
 import Muster.Connector (ConnectorConfig (..), defaultConnectorConfig, runConnector)
 import Options.Applicative
-import System.Directory (doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
 import System.Environment (getEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
@@ -77,7 +77,8 @@ data MusterAgentConfig = MusterAgentConfig
     maAgent :: String,
     maMode :: AgentMode,
     maProject :: Maybe FilePath,
-    maBusRoot :: FilePath
+    maBusRoot :: FilePath,
+    maFilter :: String
   }
   deriving (Show)
 
@@ -144,6 +145,13 @@ configParser =
           <> metavar "DIR"
           <> help "Root directory for all bus state (default: $HOME/.config/muster)"
       )
+    <*> strOption
+      ( long "filter"
+          <> short 'f'
+          <> value ""
+          <> metavar "REGEX"
+          <> help "Alert filter regex (default: @<name> — wake only when addressed)"
+      )
 
 optsInfo :: ParserInfo MusterAgentConfig
 optsInfo =
@@ -164,6 +172,11 @@ busRoot cfg = do
   if not (null explicit)
     then pure explicit
     else (</> ".config/muster") <$> getEnv "HOME"
+
+agentDir :: MusterAgentConfig -> IO FilePath
+agentDir cfg = do
+  root <- busRoot cfg
+  pure (root </> "agents" </> maName cfg)
 
 agentCursorPattern :: String -> String
 agentCursorPattern name = ".cursor-" <> name
@@ -217,19 +230,25 @@ projectDir cfg = case maProject cfg of
 main :: IO ()
 main = do
   cfg <- execParser optsInfo
+  let filter' = if null (maFilter cfg) then "@" <> maName cfg else maFilter cfg
+      cfg' = cfg {maFilter = filter'}
 
-  logErr $ "muster-agent [" <> maName cfg <> "] starting"
-  logErr $ "  mode: " <> show (maMode cfg)
-  logErr $ "  agent command: " <> maAgent cfg
+  logErr $ "muster-agent [" <> maName cfg' <> "] starting"
+  logErr $ "  mode: " <> show (maMode cfg')
+  logErr $ "  agent command: " <> maAgent cfg'
+  logErr $ "  filter: " <> maFilter cfg'
 
-  case maMode cfg of
-    OneShot -> runOneShot cfg
-    Persistent -> runPersistent cfg
+  case maMode cfg' of
+    OneShot -> runOneShot cfg'
+    Persistent -> runPersistent cfg'
 
 runOneShot :: MusterAgentConfig -> IO ()
 runOneShot cfg = do
   let agentCfg = toAgentConfig cfg
   wakeQueue <- newChan
+  -- Ensure agent output directory exists.
+  adir <- agentDir cfg
+  createDirectoryIfMissing True adir
   logErr "scanning for joined channels..."
   let go :: Map String Channel -> Map String (Async ()) -> IO ()
       go channels watchers = do
@@ -276,7 +295,7 @@ refreshChannels cfg old = do
 
 -- | Start alert watchers for newly-joined channels and cancel watchers for
 -- channels that have been left.  Each watcher runs @muster-alert -c <channel>
--- -l "[" <name>@ in a loop, signalling the main thread on every post.
+-- <filter> <name>@ in a loop, signalling the main thread on every addressed post.
 refreshWatchers ::
   MusterAgentConfig ->
   Chan String ->
@@ -310,12 +329,11 @@ alertWatcher cfg wakeQueue channel = forever $ do
 
 startAlert :: MusterAgentConfig -> String -> IO (Handle, ProcessHandle)
 startAlert cfg channel = do
-  -- The filter "[" matches every framed bus line. The watcher exits on
-  -- the first new message, the agent wakes up and re-arms it.
+  -- Filter defaults to @<name> — only wake on addressed messages.
   let rootArgs = case maBusRoot cfg of
         "" -> []
         r -> ["-r", r]
-      args = ["-c", channel] ++ rootArgs ++ ["[", maName cfg]
+      args = ["-c", channel] ++ rootArgs ++ [maFilter cfg, maName cfg]
   res <- try @SomeException $
     createProcess
       (proc "muster-alert" args)
@@ -369,25 +387,15 @@ handleMessage agentCfg cfg (channel, sender, body) = do
         case er of
           Left err -> logErr $ "  agent error: " <> show err
           Right reply -> do
-            channels <- discoveredChannels cfg
-            case Map.lookup channel (Map.fromList [(c, ()) | c <- channels]) of
-              Nothing -> logErr "  channel disappeared before reply"
-              Just () -> do
-                let chCfg = toChannelConfig cfg channel
-                res <- try @SomeException (channelAttach chCfg)
-                case res of
-                  Left err -> logErr $ "  failed to re-attach to #" <> channel <> ": " <> show err
-                  Right ch -> do
-                    let lines' = filter (not . T.null) $ map T.strip $ T.lines reply
-                    if null lines'
-                      then logErr "  (empty agent reply)"
-                      else
-                        mapM_
-                          ( \line -> do
-                              logErr $ "  post to #" <> channel <> ": " <> T.unpack (T.take 100 line)
-                              channelSend ch line
-                          )
-                          lines'
+            let lines' = filter (not . T.null) $ map T.strip $ T.lines reply
+            if null lines'
+              then logErr "  (empty agent reply)"
+              else do
+                -- Write agent output to its own bucket file.
+                adir <- agentDir cfg
+                let outPath = adir </> "output.md"
+                logErr $ "  writing output to " <> outPath
+                TIO.appendFile outPath (T.unlines lines')
 
 -- ---------------------------------------------------------------------------
 -- Meta-commands
