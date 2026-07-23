@@ -9,6 +9,49 @@
 -- @bus@.  The engine is native Haskell ('Mailbox'); the bash
 -- @mailbox.sh@ remains available on disk for rollback but is no longer
 -- invoked from this binary.
+--
+-- = design
+--
+-- The bus daemon is a dumb FIFO relay. It owns the pipe, appends to the log,
+-- and nothing else. Agent lifecycle (spawn, status, stop) is managed through
+-- filesystem state: cursor files, agent configs, PID files. There is no
+-- central registry — visibility is a read-side join.
+--
+-- This is deliberate. Industry patterns all separate communication from
+-- process supervision:
+--
+-- * IRC: @ircd@ (message relay) ≠ @NickServ\/ChanServ@ (registry)
+-- * systemd: PID 1 (supervisor) ≠ D-Bus (message bus)
+-- * Kubernetes: @etcd@ (state) ≠ @apiserver@ (interface) ≠ @kubelet@ (process)
+-- * NATS: server tracks connections but doesn't manage agent lifecycle
+-- * Erlang\/OTP: supervisor trees are hierarchical, not a single god process
+--
+-- The bus relays messages. The filesystem tracks who's alive.
+-- Different concerns, different failure modes.
+--
+-- = coordination patterns
+--
+-- Schmid (2026) identifies four subagent patterns:
+--
+-- 1. __Inline Tool__ — subagent as function call, fire-and-forget
+-- 2. __Fan-Out__ — spawn multiple, wait for results
+-- 3. __Agent Pool__ — persistent agents with messaging (spawn, send, wait, list, kill)
+-- 4. __Teams__ — agents message each other directly
+--
+-- Muster implements Pattern 3 with fewer primitives. The bus is the shared
+-- surface — every message is public, every agent can read every post. No
+-- point-to-point routing, no private channels. The coordinator steers
+-- mid-run by posting to the same bus the agents read. @muster who@ provides
+-- pool visibility without a central registry.
+--
+-- The API surface:
+--
+-- * @muster agent new\/stop\/status\/list@ — agent lifecycle
+-- * @muster post\/read\/watch\/ping@ — bus communication
+-- * @muster who@ — pool visibility (read-side join of cursors + PIDs)
+-- * @muster session open\/close\/status\/list@ — session lifecycle
+--
+-- The daemon stays dumb. The bus is the medium, not the manager.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
