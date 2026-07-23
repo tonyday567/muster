@@ -214,6 +214,7 @@ data Cmd
   | CmdWatch (Maybe String) (Maybe Int) (Maybe String) (Maybe String) Bool
   | CmdPing (Maybe String) (Maybe Int) (Maybe String) (Maybe String) Bool
   | CmdNames
+  | CmdWho
   | CmdLog
   | CmdChannels
   | CmdClean String Bool
@@ -345,6 +346,7 @@ cmdParser =
         <> command "watch" (info (CmdWatch <$> optionalNameArg <*> timeoutOpt <*> filterOpt <*> sinceOpt <*> loopOpt) (progDesc "Block until someone posts"))
         <> command "ping" (info (CmdPing <$> optionalNameArg <*> timeoutOpt <*> filterOpt <*> sinceOpt <*> loopOpt) (progDesc "Callback ping: block until someone posts"))
         <> command "names" (info (pure CmdNames) (progDesc "List participants"))
+        <> command "who" (info (pure CmdWho) (progDesc "List participants with agent/human type and liveness"))
         <> command "log" (info (pure CmdLog) (progDesc "Dump the channel log"))
         <> command "channels" (info (pure CmdChannels) (progDesc "List all channels with metadata"))
         <> command
@@ -739,6 +741,43 @@ runNames opts = do
       if null cursors
         then putStrLn $ "no participants in " <> globalChannel opts
         else mapM_ putStrLn cursors
+
+-- | List participants with agent/human type and liveness status.
+--
+-- For each participant (cursor file) on the channel:
+--   * If @~/.config/muster/agents/<name>/@ exists → agent type
+--     * Read @agent.pid@, check liveness with @kill -0@
+--     * Report: alive, dead, stale (pid file but process gone), or unknown (no pid)
+--   * Otherwise → human type
+runWho :: Global -> IO ()
+runWho opts = do
+  dir <- channelDir opts
+  exists <- doesDirectoryExist dir
+  if not exists
+    then putStrLn $ "no bus directory for " <> globalChannel opts
+    else do
+      names <- cursorNames dir
+      if null names
+        then putStrLn $ "no participants in " <> globalChannel opts
+        else do
+          root <- agentsRoot opts
+          mapM_ (reportWho root) names
+  where
+    reportWho :: FilePath -> String -> IO ()
+    reportWho root name = do
+      let adir = root </> name
+      isAgent <- doesDirectoryExist adir
+      if not isAgent
+        then putStrLn $ name <> "  human"
+        else do
+          let pidPath = adir </> "agent.pid"
+          mpid <- readPidInt pidPath
+          status <- case mpid of
+            Nothing -> pure "unknown (no pid)"
+            Just p -> do
+              alive <- pidAlive p
+              pure $ if alive then "alive (pid " <> show p <> ")" else "dead (pid " <> show p <> ")"
+          putStrLn $ name <> "  agent  " <> status
 
 runLog :: Global -> IO ()
 runLog opts = channelDir opts >>= Bus.dumpLog
@@ -1368,6 +1407,7 @@ main = do
     CmdWatch mname mto mfilter msince loopMode -> runWatch opts mname mto mfilter msince loopMode
     CmdPing mname mto mfilter msince loopMode -> runWatch opts mname mto mfilter msince loopMode
     CmdNames -> runNames opts
+    CmdWho -> runWho opts
     CmdLog -> runLog opts
     CmdChannels -> runChannels opts
     CmdClean channel yes -> runClean opts channel yes
