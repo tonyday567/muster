@@ -4,7 +4,7 @@
 
 -- | WebSocket (+ HTTP) face on a muster channel.
 --
--- Serves deck.html, /api/state (board + agents), and WS bus duplex.
+-- Serves deck.html, /api/state (board + agents), /channels, and WS bus duplex.
 --
 -- @
 --   cabal run muster-ws -- --name desk
@@ -16,7 +16,6 @@ import Muster.Channel
   ( Channel,
     ChannelConfig (..),
     channelAttach,
-    channelClose,
     channelRecvRaw,
     channelSend,
     defaultChannelConfig,
@@ -25,10 +24,11 @@ import Muster.Framing qualified as Framing
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitEither)
 import Control.Concurrent.STM
-import Control.Exception (IOException, bracket, finally, try)
-import Control.Monad (forever, void, when)
+import Control.Exception (IOException, finally, try)
+import Control.Monad (filterM, forever, void, when)
 import Data.ByteString.Lazy qualified as LBS
 import Data.FileEmbed (embedFile)
+import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
@@ -38,6 +38,7 @@ import Data.Text.IO qualified as TIO
 import Network.HTTP.Types (parseQuery, status200, status400, status404)
 import Network.Wai
   ( Application,
+    Request,
     Response,
     pathInfo,
     rawQueryString,
@@ -47,6 +48,8 @@ import Network.Wai.Handler.Warp (run)
 import Network.Wai.Handler.WebSockets (websocketsOr)
 import Network.WebSockets
   ( Connection,
+    PendingConnection (..),
+    RequestHead (..),
     ServerApp,
     acceptRequest,
     defaultConnectionOptions,
@@ -92,6 +95,42 @@ optsP =
     <*> switch (long "dev" <> help "Serve deck.html from disk (dev mode)")
     <*> strOption (long "dev-path" <> value "app/deck.html" <> showDefault <> help "Path to deck.html in dev mode")
 
+-- ---------------------------------------------------------------------------
+-- Channel cache — so we can switch channels without restart
+-- ---------------------------------------------------------------------------
+
+data ChannelEntry = ChannelEntry
+  { ceChannel :: Channel,
+    ceFan :: TChan Text,
+    cePump :: Async ()
+  }
+
+-- | A cache of active channels, keyed by channel name.
+type ChannelCache = IORef (Map.Map String ChannelEntry)
+
+-- | Get or create a channel by name.  Returns the Channel handle and its
+-- broadcast TChan for fan-out.
+getOrCreateChannel :: FilePath -> String -> Text -> ChannelCache -> IO (Channel, TChan Text)
+getOrCreateChannel root chanName identity cache = do
+  m <- readIORef cache
+  case Map.lookup chanName m of
+    Just entry -> pure (ceChannel entry, ceFan entry)
+    Nothing -> do
+      let cfg =
+            (defaultChannelConfig identity)
+              { chChannel = chanName,
+                chBusRoot = root
+              }
+      ch <- channelAttach cfg
+      fan <- newBroadcastTChanIO
+      pump <- async $ forever $ do
+        lines' <- channelRecvRaw ch
+        mapM_ (atomically . writeTChan fan) lines'
+        when (null lines') $ threadDelay 50_000
+      let entry = ChannelEntry ch fan pump
+      atomicModifyIORef' cache $ \m' -> (Map.insert chanName entry m', ())
+      pure (ch, fan)
+
 main :: IO ()
 main = do
   o <- execParser $ info (optsP <**> helper) (progDesc "HTTP+WS muster desk")
@@ -107,11 +146,6 @@ main = do
       "bus.fifo missing at " <> fifo <> " — run: muster bus start -c " <> optChannel o
 
   let name = T.pack (optName o)
-      cfg =
-        (defaultChannelConfig name)
-          { chChannel = optChannel o,
-            chBusRoot = optBusRoot o
-          }
 
   putStrLn $ "muster-ws: attaching as " <> optName o <> " on " <> optChannel o
   putStrLn $ "  log   " <> logf
@@ -119,14 +153,16 @@ main = do
   putStrLn $ "  http  http://" <> optHost o <> ":" <> show (optPort o) <> "/"
   hFlush stdout
 
-  bracket (channelAttach cfg) channelClose $ \ch -> do
-    busFan <- newBroadcastTChanIO
-    void $ async $ busPump ch busFan
-    let wsApp = clientApp ch name busFan logf (optHistory o)
-        chan = T.pack (optChannel o)
-        httpApp = staticApp boardPath agentsDir logf chan name (optDev o) (optDevPath o)
-        app = websocketsOr defaultConnectionOptions wsApp httpApp
-    run (optPort o) app
+  -- Pre-create the default channel so it's ready immediately.
+  channelCache <- newIORef Map.empty
+
+  -- Pre-attach to the default channel.
+  _ <- getOrCreateChannel root (optChannel o) name channelCache
+
+  let wsApp = clientApp root name channelCache (optHistory o)
+      httpApp = staticApp root boardPath agentsDir (T.pack (optChannel o)) name (optDev o) (optDevPath o)
+      app = websocketsOr defaultConnectionOptions wsApp httpApp
+  run (optPort o) app
 
 resolveRoot :: FilePath -> IO FilePath
 resolveRoot explicit
@@ -138,18 +174,33 @@ resolveBoard explicit
   | not (null explicit) = pure explicit
   | otherwise = (</> "mg/loom/board.md") <$> getEnv "HOME"
 
-busPump :: Channel -> TChan Text -> IO ()
-busPump ch fan = forever $ do
-  lines' <- channelRecvRaw ch
-  mapM_ (atomically . writeTChan fan) lines'
-  when (null lines') $ threadDelay 50_000
+-- | Extract the channel name from the WebSocket request's query string.
+-- Returns the default channel if none specified.
+extractChannelFromWs :: PendingConnection -> String -> String
+extractChannelFromWs pending defaultChannel =
+  let path = requestPath (pendingRequest pending)
+      -- requestPath includes the query string. Parse '?channel=NAME'.
+      pathText = decodeUtf8 path
+      chan = case T.breakOn "?channel=" pathText of
+        (_, rest) | T.null rest -> defaultChannel
+        (_, rest) ->
+          let val = T.takeWhile (/= '&') (T.drop 9 rest)  -- drop "?channel="
+          in if T.null val then defaultChannel else T.unpack val
+  in chan
 
 staticApp :: FilePath -> FilePath -> FilePath -> Text -> Text -> Bool -> FilePath -> Application
-staticApp boardPath agentsDir logf channel identity dev devPath req respond =
+staticApp root boardPath agentsDir defaultChannel identity dev devPath req respond =
   case pathInfo req of
-    [] -> serveHtml dev devPath respond
+    [] -> serveHtml dev devPath req defaultChannel respond
     ["api", "state"] -> do
-      body <- buildStateJson boardPath agentsDir logf channel identity
+      -- Read channel from query param for state endpoint too
+      let qs = parseQuery (rawQueryString req)
+          chan = case lookup "channel" qs of
+            Just (Just c) -> decodeUtf8 c
+            _ -> defaultChannel
+          chanDir = root </> T.unpack chan
+          chanLogf = chanDir </> "log.md"
+      body <- buildStateJson boardPath agentsDir chanLogf chan identity
       respond $
         responseLBS
           status200
@@ -176,12 +227,36 @@ staticApp boardPath agentsDir logf channel identity dev devPath req respond =
           respond $ responseLBS status200 [("Content-Type", "text/plain")] "ok"
         Nothing ->
           respond $ responseLBS status400 [("Content-Type", "text/plain")] "missing path"
+    ["channels"] -> do
+      dirs <- listChannels root
+      let json =
+            "[" <> T.intercalate "," (map jsonStr (map T.pack dirs)) <> "]"
+      respond $
+        responseLBS
+          status200
+          [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")]
+          (LBS.fromStrict (encodeUtf8 json))
     _ ->
       respond $
         responseLBS status404 [("Content-Type", "text/plain")] "not found"
 
-serveHtml :: Bool -> FilePath -> (Response -> IO a) -> IO a
-serveHtml dev devPath respond = do
+-- | List available channel directories under the bus root.
+listChannels :: FilePath -> IO [String]
+listChannels root = do
+  exists <- doesDirectoryExist root
+  if not exists
+    then pure []
+    else do
+      ents <- listDirectory root
+      let isChannelDir name = do
+            let full = root </> name
+                tname = T.pack name
+            isDir <- doesDirectoryExist full
+            pure (isDir && name /= "." && name /= ".." && name /= "agents" && not ("_" `T.isPrefixOf` tname) && not ("." `T.isPrefixOf` tname))
+      filterM isChannelDir ents
+
+serveHtml :: Bool -> FilePath -> Request -> Text -> (Response -> IO a) -> IO a
+serveHtml dev devPath req defaultChannel respond = do
   html <-
     if not dev
       then pure deckHtml
@@ -192,13 +267,22 @@ serveHtml dev devPath respond = do
             putStrLn $ "muster-ws: dev mode failed to read " <> devPath <> ": " <> show err
             pure deckHtml
           Right bytes -> pure bytes
+  -- Read ?channel= from query string to inject into HTML.
+  let qs = parseQuery (rawQueryString req)
+      chan = case lookup "channel" qs of
+        Just (Just c) -> decodeUtf8 c
+        _ -> defaultChannel
+      -- Inject a <script> at the top of <body> so the JS knows the default channel.
+      injected =
+        LBS.fromStrict (encodeUtf8 ("<script>window.DEFAULT_CHANNEL=\"" <> chan <> "\";</script>\n"))
+        <> html
   respond $
     responseLBS
       status200
       [ ("Content-Type", "text/html; charset=utf-8"),
         ("Cache-Control", "no-store, no-cache, must-revalidate")
       ]
-      html
+      injected
 
 buildStateJson :: FilePath -> FilePath -> FilePath -> Text -> Text -> IO Text
 buildStateJson boardPath agentsDir logf channel identity = do
@@ -243,7 +327,7 @@ buildStateJson boardPath agentsDir logf channel identity = do
         T.intercalate "," (map jsonStr busNames),
         "],\"session\":",
         sessionJson,
-        "}" 
+        "}"
       ]
 
 data SessionInfo = SessionInfo
@@ -419,13 +503,31 @@ readFileUtf8 path = do
   exists <- doesFileExist path
   if not exists then pure "" else TIO.readFile path
 
-clientApp :: Channel -> Text -> TChan Text -> FilePath -> Int -> ServerApp
-clientApp ch name fan logf hist pending = do
-  conn <- acceptRequest pending
-  clientSession ch name fan logf hist conn
+-- | Read the log for a channel (not necessarily the default one).
+readHistory :: FilePath -> Int -> IO [Text]
+readHistory path n = do
+  exists <- doesFileExist path
+  if not exists || n <= 0
+    then pure []
+    else do
+      raw <- TIO.readFile path
+      let ls = filter (not . T.null) $ T.lines raw
+      pure $ drop (max 0 (length ls - n)) ls
 
-clientSession :: Channel -> Text -> TChan Text -> FilePath -> Int -> Connection -> IO ()
-clientSession ch _name fan logf hist conn = do
+-- ---------------------------------------------------------------------------
+-- WebSocket handling — now channel-aware
+-- ---------------------------------------------------------------------------
+
+clientApp :: FilePath -> Text -> ChannelCache -> Int -> ServerApp
+clientApp root identity cache hist pending = do
+  conn <- acceptRequest pending
+  let chan = extractChannelFromWs pending (T.unpack identity)  -- default to identity
+  (ch, fan) <- getOrCreateChannel root chan (T.pack chan) cache
+  let logf = root </> chan </> "log.md"
+  clientSession ch fan logf hist conn
+
+clientSession :: Channel -> TChan Text -> FilePath -> Int -> Connection -> IO ()
+clientSession ch fan logf hist conn = do
   histLines <- readHistory logf hist
   mapM_ (sendTextData conn) histLines
   inQ <- newTQueueIO
@@ -455,14 +557,3 @@ waitEitherCancel a b = do
   void $ waitEither a b
   cancel a
   cancel b
-
-readHistory :: FilePath -> Int -> IO [Text]
-readHistory path n = do
-  exists <- doesFileExist path
-  if not exists || n <= 0
-    then pure []
-    else do
-      raw <- TIO.readFile path
-      let ls = filter (not . T.null) $ T.lines raw
-      pure $ drop (max 0 (length ls - n)) ls
- 

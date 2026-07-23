@@ -38,6 +38,17 @@
       padding-bottom: 0.45rem;
     }
     header strong { color: var(--accent); font-weight: 600; }
+    #channelSelect {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.15rem 0.35rem;
+      font: inherit;
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+    #channelSelect:focus { outline: 1px solid var(--accent); }
     #status { color: var(--muted); }
     #status.ok { color: var(--live); }
     #status.bad { color: var(--link); }
@@ -119,6 +130,9 @@
 <body>
   <header>
     <strong>⚛ deck</strong>
+    <select id="channelSelect">
+      <option value="">loading…</option>
+    </select>
     <span id="channelBadge" class="badge"></span>
     <span id="identityBadge" class="badge"></span>
     <span id="status" class="dot down" title="connecting"></span>
@@ -137,14 +151,22 @@
     const msgEl = document.getElementById('msg');
     const channelBadge = document.getElementById('channelBadge');
     const identityBadge = document.getElementById('identityBadge');
+    const channelSelect = document.getElementById('channelSelect');
     let ws;
     let backoff = 2000;
     let intentionalClose = false;
 
+    // ── channel from URL or server default ──
+    function currentChannel() {
+      const p = new URLSearchParams(window.location.search);
+      return p.get('channel') || (window.DEFAULT_CHANNEL || 'bus');
+    }
+
     function defaultWsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      if (location.host) return proto + '//' + location.host + '/';
-      return 'ws://127.0.0.1:9162/';
+      const chan = currentChannel();
+      if (location.host) return proto + '//' + location.host + '/?channel=' + encodeURIComponent(chan);
+      return 'ws://127.0.0.1:9162/?channel=' + encodeURIComponent(chan);
     }
 
     /** Only pin to bottom if the user is already near the end (or empty). */
@@ -240,6 +262,8 @@
         backoff = 2000;
         // server re-sends history on connect — clear first to avoid dups + scroll fight
         clearLog();
+        // update badge
+        channelBadge.textContent = currentChannel();
       };
       ws.onclose = () => {
         setStatus('stale', 'reconnecting');
@@ -273,6 +297,49 @@
       connect();
     };
 
+    // ── channel dropdown ──
+    channelSelect.addEventListener('change', function () {
+      const val = this.value;
+      if (!val) return;
+      // reload with the new channel
+      window.location.search = '?channel=' + encodeURIComponent(val);
+    });
+
+    // Populate channel list from /channels endpoint
+    async function loadChannels() {
+      try {
+        const resp = await fetch('/channels', { cache: 'no-store' });
+        if (!resp.ok) return;
+        const names = await resp.json();
+        channelSelect.innerHTML = '';
+        const current = currentChannel();
+        let found = false;
+        for (const name of names) {
+          const opt = document.createElement('option');
+          opt.value = name;
+          opt.textContent = name;
+          if (name === current) {
+            opt.selected = true;
+            found = true;
+          }
+          channelSelect.appendChild(opt);
+        }
+        // If the current channel isn't in the list, add it anyway
+        if (!found && current) {
+          const opt = document.createElement('option');
+          opt.value = current;
+          opt.textContent = current;
+          opt.selected = true;
+          channelSelect.appendChild(opt);
+        }
+      } catch (_) {
+        // server may not have /channels yet (old muster-ws) — ignore
+        channelSelect.innerHTML = '<option value="">' + currentChannel() + '</option>';
+      }
+    }
+
+    channelBadge.textContent = currentChannel();
+    loadChannels();
     connect();
   </script>
 </body>
