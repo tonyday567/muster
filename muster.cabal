@@ -70,7 +70,7 @@ library
 
     build-depends:
         base,
-        circuits >=0.1.0.0 && <0.3,
+        circuits >=0.1.0.0 && <0.4,
         circuits-repl,
         text,
         time,

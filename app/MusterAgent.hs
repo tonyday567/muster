@@ -254,14 +254,22 @@ runOneShot cfg = do
       go channels watchers = do
         newChannels <- refreshChannels cfg channels
         newWatchers <- refreshWatchers cfg wakeQueue watchers newChannels
-        channelName <- readChan wakeQueue
-        case Map.lookup channelName newChannels of
-          Nothing -> go newChannels newWatchers
-          Just ch -> do
-            msgs <- channelRecv ch
-            unless (null msgs) $
-              mapM_ (\(s, b) -> handleMessage agentCfg cfg (channelName, s, b)) msgs
+        -- Avoid deadlock: if no channels are joined, sleep and rescan
+        -- rather than blocking indefinitely on an empty wakeQueue.
+        if Map.null newChannels
+          then do
+            logErr "  no channels joined; sleeping 5s before rescan..."
+            threadDelay 5_000_000
             go newChannels newWatchers
+          else do
+            channelName <- readChan wakeQueue
+            case Map.lookup channelName newChannels of
+              Nothing -> go newChannels newWatchers
+              Just ch -> do
+                msgs <- channelRecv ch
+                unless (null msgs) $
+                  mapM_ (\(s, b) -> handleMessage agentCfg cfg (channelName, s, b)) msgs
+                go newChannels newWatchers
   go Map.empty Map.empty
 
 -- | Refresh the set of attached channels.  Returns a map from channel name to
