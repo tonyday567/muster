@@ -7,7 +7,7 @@
 -- Serves deck.html, /api/state (board + agents), /channels, and WS bus duplex.
 --
 -- @
---   cabal run muster-ws -- --name desk
+--   cabal run muster-ws -- --name deck
 --   open http://127.0.0.1:9162/
 -- @
 module Main where
@@ -19,6 +19,18 @@ import Muster.Channel
     channelRecvRaw,
     channelSend,
     defaultChannelConfig,
+  )
+import Muster.Cli.Opts
+  ( boardOpt,
+    busRootOpt,
+    channelOpt,
+    devOpt,
+    devPathOpt,
+    historyOpt,
+    hostOpt,
+    nameOpt,
+    portOpt,
+    resolveBusRoot,
   )
 import Muster.Framing qualified as Framing
 import Control.Concurrent (threadDelay)
@@ -82,18 +94,19 @@ data Opts = Opts
     optDevPath :: FilePath
   }
 
+-- | Same channel / name / bus-root vocabulary as @muster@ CLI ('Muster.Cli.Opts').
 optsP :: Parser Opts
 optsP =
   Opts
-    <$> strOption (long "name" <> short 'n' <> value "desk" <> showDefault <> help "Bus identity")
-    <*> strOption (long "channel" <> short 'c' <> value "bus" <> showDefault)
-    <*> strOption (long "bus-root" <> value "" <> help "Default: $HOME/.config/muster")
-    <*> strOption (long "host" <> value "127.0.0.1" <> showDefault)
-    <*> option auto (long "port" <> short 'p' <> value 9162 <> showDefault)
-    <*> option auto (long "history" <> value 80 <> showDefault <> help "Log lines on WS connect")
-    <*> strOption (long "board" <> value "" <> help "Default: $HOME/mg/loom/board.md")
-    <*> switch (long "dev" <> help "Serve deck.html from disk (dev mode)")
-    <*> strOption (long "dev-path" <> value "app/deck.html" <> showDefault <> help "Path to deck.html in dev mode")
+    <$> nameOpt "deck"
+    <*> channelOpt
+    <*> busRootOpt
+    <*> hostOpt
+    <*> portOpt 9162
+    <*> historyOpt
+    <*> boardOpt
+    <*> devOpt
+    <*> devPathOpt
 
 -- ---------------------------------------------------------------------------
 -- Channel cache — so we can switch channels without restart
@@ -133,8 +146,8 @@ getOrCreateChannel root chanName identity cache = do
 
 main :: IO ()
 main = do
-  o <- execParser $ info (optsP <**> helper) (progDesc "HTTP+WS muster desk")
-  root <- resolveRoot (optBusRoot o)
+  o <- execParser $ info (optsP <**> helper) (progDesc "HTTP+WS muster deck")
+  root <- resolveBusRoot (optBusRoot o)
   boardPath <- resolveBoard (optBoard o)
   let dir = root </> optChannel o
       fifo = dir </> "bus.fifo"
@@ -143,14 +156,15 @@ main = do
   ok <- doesFileExist fifo
   when (not ok) $
     error $
-      "bus.fifo missing at " <> fifo <> " — run: muster bus start -c " <> optChannel o
+      "bus.fifo missing at " <> fifo <> " — run: muster bus start (channel " <> optChannel o <> ")"
 
   let name = T.pack (optName o)
 
   putStrLn $ "muster-ws: attaching as " <> optName o <> " on " <> optChannel o
-  putStrLn $ "  log   " <> logf
-  putStrLn $ "  board " <> boardPath
-  putStrLn $ "  http  http://" <> optHost o <> ":" <> show (optPort o) <> "/"
+  putStrLn $ "  bus-root " <> root
+  putStrLn $ "  log      " <> logf
+  putStrLn $ "  board    " <> boardPath
+  putStrLn $ "  http     http://" <> optHost o <> ":" <> show (optPort o) <> "/"
   hFlush stdout
 
   -- Pre-create the default channel so it's ready immediately.
@@ -159,15 +173,18 @@ main = do
   -- Pre-attach to the default channel.
   _ <- getOrCreateChannel root (optChannel o) name channelCache
 
-  let wsApp = clientApp root name channelCache (optHistory o)
-      httpApp = staticApp root boardPath agentsDir (T.pack (optChannel o)) name (optDev o) (optDevPath o)
+  let wsApp = clientApp root name (optChannel o) channelCache (optHistory o)
+      httpApp =
+        staticApp
+          root
+          boardPath
+          agentsDir
+          (T.pack (optChannel o))
+          name
+          (optDev o)
+          (optDevPath o)
       app = websocketsOr defaultConnectionOptions wsApp httpApp
   run (optPort o) app
-
-resolveRoot :: FilePath -> IO FilePath
-resolveRoot explicit
-  | not (null explicit) = pure explicit
-  | otherwise = (</> ".config/muster") <$> getEnv "HOME"
 
 resolveBoard :: FilePath -> IO FilePath
 resolveBoard explicit
@@ -191,7 +208,7 @@ extractChannelFromWs pending defaultChannel =
 staticApp :: FilePath -> FilePath -> FilePath -> Text -> Text -> Bool -> FilePath -> Application
 staticApp root boardPath agentsDir defaultChannel identity dev devPath req respond =
   case pathInfo req of
-    [] -> serveHtml dev devPath req defaultChannel respond
+    [] -> serveHtml dev devPath req defaultChannel identity root respond
     ["api", "state"] -> do
       -- Read channel from query param for state endpoint too
       let qs = parseQuery (rawQueryString req)
@@ -255,8 +272,8 @@ listChannels root = do
             pure (isDir && name /= "." && name /= ".." && name /= "agents" && not ("_" `T.isPrefixOf` tname) && not ("." `T.isPrefixOf` tname))
       filterM isChannelDir ents
 
-serveHtml :: Bool -> FilePath -> Request -> Text -> (Response -> IO a) -> IO a
-serveHtml dev devPath req defaultChannel respond = do
+serveHtml :: Bool -> FilePath -> Request -> Text -> Text -> FilePath -> (Response -> IO a) -> IO a
+serveHtml dev devPath req defaultChannel identity busRootPath respond = do
   html <-
     if not dev
       then pure deckHtml
@@ -267,15 +284,30 @@ serveHtml dev devPath req defaultChannel respond = do
             putStrLn $ "muster-ws: dev mode failed to read " <> devPath <> ": " <> show err
             pure deckHtml
           Right bytes -> pure bytes
-  -- Read ?channel= from query string to inject into HTML.
+  -- Same three knobs as optparse globals, injected for the page.
   let qs = parseQuery (rawQueryString req)
       chan = case lookup "channel" qs of
         Just (Just c) -> decodeUtf8 c
         _ -> defaultChannel
-      -- Inject a <script> at the top of <body> so the JS knows the default channel.
+      escape t = T.replace "\\" "\\\\" $ T.replace "\"" "\\\"" t
       injected =
-        LBS.fromStrict (encodeUtf8 ("<script>window.DEFAULT_CHANNEL=\"" <> chan <> "\";</script>\n"))
-        <> html
+        LBS.fromStrict
+          ( encodeUtf8 $
+              T.concat
+                [ "<script>",
+                  "window.DEFAULT_CHANNEL=\"",
+                  escape chan,
+                  "\";",
+                  "window.DEFAULT_NAME=\"",
+                  escape identity,
+                  "\";",
+                  "window.DEFAULT_BUS_ROOT=\"",
+                  escape (T.pack busRootPath),
+                  "\";",
+                  "</script>\n"
+                ]
+          )
+          <> html
   respond $
     responseLBS
       status200
@@ -518,11 +550,13 @@ readHistory path n = do
 -- WebSocket handling — now channel-aware
 -- ---------------------------------------------------------------------------
 
-clientApp :: FilePath -> Text -> ChannelCache -> Int -> ServerApp
-clientApp root identity cache hist pending = do
+clientApp :: FilePath -> Text -> String -> ChannelCache -> Int -> ServerApp
+clientApp root identity defaultChannel cache hist pending = do
   conn <- acceptRequest pending
-  let chan = extractChannelFromWs pending (T.unpack identity)  -- default to identity
-  (ch, fan) <- getOrCreateChannel root chan (T.pack chan) cache
+  -- WS query ?channel=NAME; fall back to the process default channel (not the nick).
+  let chan = extractChannelFromWs pending defaultChannel
+  -- Attach as the deck identity on every channel so posts show as "deck", not the channel name.
+  (ch, fan) <- getOrCreateChannel root chan identity cache
   let logf = root </> chan </> "log.md"
   clientSession ch fan logf hist conn
 

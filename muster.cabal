@@ -60,8 +60,14 @@ library
     import:           warnings
 
     exposed-modules:
+        Muster.Api.Types
+        Muster.Api.Bus
+        Muster.Api.Participant
+        Muster.Api.Agent
+        Muster.Api.Orchestrator
         Muster.Bus
         Muster.Channel
+        Muster.Cli.Opts
         Muster.Config
         Muster.Cursor
         Muster.Framing
@@ -70,13 +76,17 @@ library
 
     build-depends:
         base,
+        async,
         circuits >=0.1.0.0 && <0.4,
         circuits-repl,
-        text,
-        time,
+        containers,
         directory,
         filepath,
+        optparse-applicative,
         process,
+        stm,
+        text,
+        time,
         unix
 
     hs-source-dirs:   src
@@ -88,7 +98,7 @@ executable muster
     import:           warnings
 
     -- .hs or .lhs file containing the Main module.
-    main-is:          Main.hs
+    main-is:          Muster.hs
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -194,4 +204,36 @@ executable muster-alert
 
     hs-source-dirs:   app
 
+    default-language: GHC2021
+
+test-suite muster-doctest
+    import:           warnings
+
+    type:             exitcode-stdio-1.0
+    main-is:          Doctest.hs
+    build-depends:
+        base,
+        doctest,
+        muster
+
+    hs-source-dirs:   test
+    default-language: GHC2021
+
+test-suite muster-test
+    import:           warnings
+
+    type:             exitcode-stdio-1.0
+    main-is:          Test.hs
+    build-depends:
+        base,
+        muster,
+        tasty,
+        tasty-hunit,
+        text,
+        directory,
+        filepath,
+        process,
+        temporary
+
+    hs-source-dirs:   test
     default-language: GHC2021

@@ -242,10 +242,10 @@ data SessionCmd
   | SessionList
   deriving (Show, Eq)
 
-data DeskCmd
-  = DeskStart String Int Bool
-  | DeskStop
-  | DeskStatus
+data DeckCmd
+  = DeckStart String Int Bool
+  | DeckStop
+  | DeckStatus
   deriving (Show, Eq)
 
 data Cmd
@@ -264,7 +264,7 @@ data Cmd
   | CmdPrune String Int Bool
   | CmdAgent AgentCmd
   | CmdSession SessionCmd
-  | CmdDesk DeskCmd
+  | CmdDeck DeckCmd
   deriving (Show)
 
 nameArg :: Parser String
@@ -417,10 +417,10 @@ cmdParser =
               (progDesc "Session lifecycle (open/close/status/list)")
           )
         <> command
-          "desk"
+          "deck"
           ( info
-              (CmdDesk <$> deskCmdParser)
-              (progDesc "Desk web UI lifecycle")
+              (CmdDeck <$> deckCmdParser)
+              (progDesc "Deck web UI lifecycle")
           )
     )
 
@@ -516,18 +516,18 @@ sessionCmdParser =
         <> command "list" (info (pure SessionList) (progDesc "List all open sessions"))
     )
 
-deskNameOpt :: Parser String
-deskNameOpt =
+deckNameOpt :: Parser String
+deckNameOpt =
   strOption
     ( long "name"
         <> short 'n'
-        <> value "desk"
+        <> value "deck"
         <> showDefault
-        <> help "Desk identity on the bus"
+        <> help "Deck identity on the bus"
     )
 
-deskPortOpt :: Parser Int
-deskPortOpt =
+deckPortOpt :: Parser Int
+deckPortOpt =
   option
     auto
     ( long "port"
@@ -537,24 +537,24 @@ deskPortOpt =
         <> help "HTTP port"
     )
 
-deskDevOpt :: Parser Bool
-deskDevOpt =
+deckDevOpt :: Parser Bool
+deckDevOpt =
   switch
     ( long "dev"
         <> help "Serve deck.html from disk (app/deck.html) instead of embedded"
     )
 
-deskCmdParser :: Parser DeskCmd
-deskCmdParser =
+deckCmdParser :: Parser DeckCmd
+deckCmdParser =
   hsubparser
     ( command
         "start"
         ( info
-            (DeskStart <$> deskNameOpt <*> deskPortOpt <*> deskDevOpt)
-            (progDesc "Start the web desk")
+            (DeckStart <$> deckNameOpt <*> deckPortOpt <*> deckDevOpt)
+            (progDesc "Start the web deck")
         )
-        <> command "stop" (info (pure DeskStop) (progDesc "Stop the web desk"))
-        <> command "status" (info (pure DeskStatus) (progDesc "Report desk health"))
+        <> command "stop" (info (pure DeckStop) (progDesc "Stop the web deck"))
+        <> command "status" (info (pure DeckStatus) (progDesc "Report deck health"))
     )
 
 data Options = Options Global Cmd
@@ -1346,28 +1346,28 @@ runAgent opts = \case
   AgentStatus (Just name) -> runAgentStatusOne opts name
   AgentList -> runAgentList opts
 
--- | Desk pid file inside a channel directory.
-deskPidFile :: FilePath -> FilePath
-deskPidFile dir = dir </> "desk.pid"
+-- | Deck pid file inside a channel directory.
+deckPidFile :: FilePath -> FilePath
+deckPidFile dir = dir </> "deck.pid"
 
-runDesk :: Global -> DeskCmd -> IO ()
-runDesk opts = \case
-  DeskStart name port dev -> runDeskStart opts name port dev
-  DeskStop -> runDeskStop opts
-  DeskStatus -> runDeskStatus opts
+runDeck :: Global -> DeckCmd -> IO ()
+runDeck opts = \case
+  DeckStart name port dev -> runDeckStart opts name port dev
+  DeckStop -> runDeckStop opts
+  DeckStatus -> runDeckStatus opts
 
-runDeskStart :: Global -> String -> Int -> Bool -> IO ()
-runDeskStart opts name port dev = do
+runDeckStart :: Global -> String -> Int -> Bool -> IO ()
+runDeckStart opts name port dev = do
   dir <- channelDir opts
   createDirectoryIfMissing True dir
-  let pidPath = deskPidFile dir
-      logPath = dir </> "desk.log"
+  let pidPath = deckPidFile dir
+      logPath = dir </> "deck.log"
   mpid <- readPidInt pidPath
   case mpid of
     Just p -> do
       alive <- pidAlive p
       when alive do
-        hPutStrLn stderr $ "muster: desk already running (pid " <> show p <> ")"
+        hPutStrLn stderr $ "muster: deck already running (pid " <> show p <> ")"
         exitWith (ExitFailure 1)
     Nothing -> pure ()
   let args =
@@ -1395,48 +1395,48 @@ runDeskStart opts name port dev = do
   mpid' <- readPidInt pidPath
   case mpid' of
     Nothing -> do
-      hPutStrLn stderr $ "muster: desk pid not written — see " <> logPath
+      hPutStrLn stderr $ "muster: deck pid not written — see " <> logPath
       exitWith (ExitFailure 1)
     Just p -> do
       alive <- pidAlive p
       if alive
-        then putStrLn $ "desk started on http://127.0.0.1:" <> show port <> " (pid " <> show p <> ")"
+        then putStrLn $ "deck started on http://127.0.0.1:" <> show port <> " (pid " <> show p <> ")"
         else do
-          hPutStrLn stderr $ "muster: desk died immediately — see " <> logPath
+          hPutStrLn stderr $ "muster: deck died immediately — see " <> logPath
           exitWith (ExitFailure 1)
 
-runDeskStop :: Global -> IO ()
-runDeskStop opts = do
+runDeckStop :: Global -> IO ()
+runDeckStop opts = do
   dir <- channelDir opts
-  let pidPath = deskPidFile dir
+  let pidPath = deckPidFile dir
   mpid <- readPidInt pidPath
   case mpid of
-    Nothing -> putStrLn $ "no desk running on " <> globalChannel opts
+    Nothing -> putStrLn $ "no deck running on " <> globalChannel opts
     Just p -> do
       alive <- pidAlive p
       if alive
         then do
           killPid p
           removeFile pidPath
-          putStrLn $ "desk stopped (was pid " <> show p <> ")"
+          putStrLn $ "deck stopped (was pid " <> show p <> ")"
         else do
           removeFile pidPath
-          putStrLn $ "desk stale pid " <> show p <> " removed"
+          putStrLn $ "deck stale pid " <> show p <> " removed"
 
-runDeskStatus :: Global -> IO ()
-runDeskStatus opts = do
+runDeckStatus :: Global -> IO ()
+runDeckStatus opts = do
   dir <- channelDir opts
-  let pidPath = deskPidFile dir
+  let pidPath = deckPidFile dir
   mpid <- readPidInt pidPath
   case mpid of
-    Nothing -> putStrLn $ "no desk on " <> globalChannel opts
+    Nothing -> putStrLn $ "no deck on " <> globalChannel opts
     Just p -> do
       alive <- pidAlive p
       if alive
-        then putStrLn $ "desk alive on " <> globalChannel opts <> " (pid " <> show p <> ")"
+        then putStrLn $ "deck alive on " <> globalChannel opts <> " (pid " <> show p <> ")"
         else do
           removeFile pidPath
-          putStrLn $ "desk stale pid " <> show p <> " removed"
+          putStrLn $ "deck stale pid " <> show p <> " removed"
 
 main :: IO ()
 main = do
@@ -1457,4 +1457,4 @@ main = do
     CmdPrune channel keep yes -> runPrune opts channel keep yes
     CmdAgent ac -> runAgent opts ac
     CmdSession sc -> runSession opts sc
-    CmdDesk dc -> runDesk opts dc
+    CmdDeck dc -> runDeck opts dc

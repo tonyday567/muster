@@ -423,20 +423,20 @@ parseMetaCommand t =
 runMusterJoin :: MusterAgentConfig -> String -> IO ()
 runMusterJoin cfg channel = do
   logErr $ "  joining #" <> channel
-  void $ try @SomeException $ runMuster cfg channel ["join", maName cfg]
+  void $ try @SomeException $ runMuster cfg ["name", maName cfg]
+  void $ try @SomeException $ runMuster cfg ["join", channel]
 
 runMusterLeave :: MusterAgentConfig -> String -> IO ()
-runMusterLeave cfg channel = do
-  logErr $ "  leaving #" <> channel
-  void $ try @SomeException $ runMuster cfg channel ["leave", maName cfg]
+runMusterLeave cfg _channel = do
+  logErr "  leaving current channel"
+  void $ try @SomeException $ runMuster cfg ["leave"]
 
-runMuster :: MusterAgentConfig -> String -> [String] -> IO ()
-runMuster cfg channel args = do
+runMuster :: MusterAgentConfig -> [String] -> IO ()
+runMuster cfg args = do
   let rootArg = case maBusRoot cfg of
         "" -> []
         r -> ["--bus-root", r]
-      allArgs = ["-c", channel] <> rootArg <> args
-      cmd = proc "muster" allArgs
+      cmd = proc "muster" (rootArg <> args)
   (_, _, _, ph) <- createProcess cmd
   _ <- waitForProcess ph
   pure ()

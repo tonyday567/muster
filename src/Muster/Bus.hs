@@ -17,6 +17,7 @@ module Muster.Bus
     busStatus,
     busLiveness,
     busDaemon,
+    busRunning,
     post,
     readNew,
     readTail,
