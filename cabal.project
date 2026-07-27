@@ -1,6 +1,13 @@
 packages:
   ./muster.cabal
-  ../circuits-repl
+  ../circuits-agent/circuits-agent.cabal
   ../circuits/circuits.cabal
+  ../circuits-ad/circuits-ad.cabal
+  ../circuits-poly/circuits-poly.cabal
+  ../harpie/harpie.cabal
+  ../harpie-numhask/harpie-numhask.cabal
+  ../numhask/numhask.cabal
+  ../numhask-diff/numhask-diff.cabal
+  ../process-stats/process-stats.cabal
 
 write-ghc-environment-files: always

@@ -4,9 +4,9 @@
 
 -- | High-level muster channel handle.
 --
--- A thin wrapper around 'Circuit.Comm' that adds the native muster bus daemon
--- lifecycle and muster-specific path/layout conventions. All FIFO, cursor,
--- framing, and send/recv logic is delegated to 'Circuit.Comm'.
+-- Product-side channel transport over the native muster bus: layout + daemon
+-- ownership here; framing and cursor core from 'circuits-agent'. Does not use
+-- 'Circuit.Agent.Comm' (cat-FIFO absorb leftover).
 module Muster.Channel
   ( ChannelConfig (..),
     Channel,
@@ -21,13 +21,29 @@ module Muster.Channel
   )
 where
 
-import Circuit.Comm qualified as Comm
+import Control.Concurrent (threadDelay)
 import Control.Monad (when)
+import Cursor qualified as Cur
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Muster.Bus qualified as Bus
+import Muster.Framing (formatNow, frameMessage, parseMessage)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getEnv)
 import System.FilePath ((</>))
+import System.IO
+  ( BufferMode (NoBuffering),
+    Handle,
+    IOMode (WriteMode),
+    hClose,
+    hFlush,
+    hSetBuffering,
+    hSetEncoding,
+    openFile,
+    utf8,
+  )
 import Prelude
 
 -- | Channel configuration.
@@ -40,12 +56,13 @@ data ChannelConfig = ChannelConfig
 
 -- | A connected channel handle.
 --
--- Wraps a 'Circuit.Comm.Channel' plus ownership of the native muster bus
--- daemon. Keeping the write-end open prevents the bus daemon from seeing EOF
--- between messages.
+-- Persistent FIFO write end + file cursor on the channel log. Optional
+-- ownership of the per-channel bus start/stop lifecycle.
 data Channel = Channel
   { chCfg :: ChannelConfig,
-    chComm :: Comm.Channel,
+    chDir :: FilePath,
+    chWriteH :: Handle,
+    chCursor :: Cur.Cursor,
     chOwnsBus :: Bool
   }
 
@@ -70,19 +87,14 @@ channelDir cfg = do
   root <- resolveRoot (chBusRoot cfg)
   pure (root </> chChannel cfg)
 
--- | Convert a muster channel config to a 'Circuit.Comm.ChannelConfig'.
-toCommConfig :: ChannelConfig -> IO Comm.ChannelConfig
-toCommConfig cfg = do
-  dir <- channelDir cfg
-  pure
-    Comm.ChannelConfig
-      { Comm.chStdinPath = dir </> "bus.fifo",
-        Comm.chStdoutPath = dir </> "log.md",
-        Comm.chStderrPath = dir </> "err.md",
-        Comm.chCursorPath = Just (dir </> ".cursor-" <> T.unpack (chName cfg)),
-        Comm.chName = chName cfg,
-        Comm.chWorkingDir = dir
-      }
+cursorPath :: ChannelConfig -> FilePath -> FilePath
+cursorPath cfg dir = dir </> ".cursor-" <> T.unpack (chName cfg)
+
+logPath :: FilePath -> FilePath
+logPath dir = dir </> "log.md"
+
+fifoPath :: FilePath -> FilePath
+fifoPath dir = dir </> "bus.fifo"
 
 -- | Open a channel, starting the bus if necessary.
 --
@@ -91,37 +103,75 @@ channelOpen :: ChannelConfig -> IO Channel
 channelOpen cfg = do
   dir <- channelDir cfg
   Bus.busStart dir (chChannel cfg) (chBusRoot cfg)
-  commCfg <- toCommConfig cfg
-  ch <- Comm.channelAttach commCfg
-  pure $ Channel cfg ch True
+  ch <- attachDir cfg dir
+  pure ch {chOwnsBus = True}
 
 -- | Attach to an existing channel without starting the bus.
+--
+-- Fresh cursors (position 0) seek to the current end of the log so the next
+-- recv only sees future traffic. Existing cursor files resume.
 channelAttach :: ChannelConfig -> IO Channel
 channelAttach cfg = do
-  commCfg <- toCommConfig cfg
-  ch <- Comm.channelAttach commCfg
-  pure $ Channel cfg ch False
+  dir <- channelDir cfg
+  createDirectoryIfMissing True dir
+  attachDir cfg dir
+
+attachDir :: ChannelConfig -> FilePath -> IO Channel
+attachDir cfg dir = do
+  let logFile = logPath dir
+      curP = cursorPath cfg dir
+  -- Ensure log exists so poll/seek do not race a missing file.
+  exists <- doesFileExist logFile
+  when (not exists) $ appendFile logFile ""
+  c <- Cur.newFile curP
+  pos <- Cur.get c
+  when (pos == 0) $ Cur.seekEndFile c logFile
+  writeH <- openFile (fifoPath dir) WriteMode
+  hSetEncoding writeH utf8
+  hSetBuffering writeH NoBuffering
+  pure
+    Channel
+      { chCfg = cfg,
+        chDir = dir,
+        chWriteH = writeH,
+        chCursor = c,
+        chOwnsBus = False
+      }
 
 -- | Close a channel handle.
 channelClose :: Channel -> IO ()
 channelClose ch = do
-  Comm.channelClose (chComm ch)
-  when (chOwnsBus ch) $ do
-    dir <- channelDir (chCfg ch)
-    Bus.busStop dir
+  hClose (chWriteH ch)
+  when (chOwnsBus ch) $ Bus.busStop (chDir ch)
 
 -- | Send a framed message to the channel.
 channelSend :: Channel -> Text -> IO ()
-channelSend ch = Comm.channelSend (chComm ch)
+channelSend ch body = do
+  ts <- formatNow
+  TIO.hPutStrLn (chWriteH ch) (frameMessage ts (chName (chCfg ch)) body)
+  hFlush (chWriteH ch)
 
 -- | Receive all new messages since the last poll.
 channelRecv :: Channel -> IO [(Text, Text)]
-channelRecv ch = Comm.channelRecv (chComm ch)
+channelRecv ch = mapMaybe parseMessage <$> channelRecvRaw ch
 
 -- | Receive all new raw log lines since the last poll.
 channelRecvRaw :: Channel -> IO [Text]
-channelRecvRaw ch = Comm.channelRecvRaw (chComm ch)
+channelRecvRaw ch = Cur.pollFile (chCursor ch) (logPath (chDir ch))
 
--- | Block until new messages arrive, or the timeout fires.
+-- | Block until new messages arrive, or the timeout fires (microseconds).
 channelRecvBlocking :: Channel -> Int -> IO (Maybe [(Text, Text)])
-channelRecvBlocking ch = Comm.channelRecvBlocking (chComm ch)
+channelRecvBlocking ch timeoutUs = go 0 10000
+  where
+    go elapsed delay = do
+      msgs <- channelRecv ch
+      if not (null msgs)
+        then pure (Just msgs)
+        else do
+          let elapsed' = elapsed + delay
+          if elapsed' >= timeoutUs
+            then pure Nothing
+            else do
+              threadDelay delay
+              let delay' = min 500000 (floor (fromIntegral delay * 1.5 :: Double))
+              go elapsed' delay'

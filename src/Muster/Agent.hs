@@ -2,7 +2,12 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Agent utilities: address matching and oneshot external-agent queries.
+-- | Agent utilities: address matching and living 'Shard' adapters.
+--
+-- Evaluate is a circuits-agent 'Shard': commit @[Post]@, emit @[Post]@.
+-- @oneshotShard@ is one adapter (CLI per eval + session file opacity).
+-- Multi-round dialogue is repeated 'runShard', not a different seat type.
+-- This is not a rewrite of the bus — only the evaluate step is seated.
 module Muster.Agent
   ( AgentMode (..),
     AgentConfig (..),
@@ -10,12 +15,27 @@ module Muster.Agent
     addressedTo,
     stripAddress,
     agentQuery,
+
+    -- * Living agent as Shard
+    queryShard,
+    oneshotShard,
+    echoShard,
+    runShard,
+    sessionPrompt,
+    replyPosts,
+
+    -- * Re-exports (seat types)
+    Post (..),
+    Shard,
   )
 where
 
+import Circuit.Agent (Ends (..), Post (..), Shard, close, shard)
+import Control.Arrow (Kleisli (..), runKleisli)
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
-import Data.Maybe (fromMaybe)
+import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -221,3 +241,69 @@ cleanAgentOut =
               || c == '└'
               || c == '┘'
        in T.all ok t
+
+-- ---------------------------------------------------------------------------
+-- Living agent as Shard IO (seat, not rewrite)
+-- ---------------------------------------------------------------------------
+
+-- | Session assembly for the opaque seat: bodies, oldest-first, one per line.
+--
+-- This is the discoverable side of the boundary (data).  How hermes folds it
+-- is not.
+sessionPrompt :: [Post] -> Text
+sessionPrompt = T.intercalate "\n" . map body
+
+-- | Build reply posts from a cleaned agent response.
+--
+-- Addresses the last input's author on the last input's channel (conversation
+-- reply).  Empty reply → no posts (quiet).
+replyPosts :: Text -> [Post] -> Text -> [Post]
+replyPosts who ins reply =
+  case (listToMaybe (reverse ins), T.strip reply) of
+    (_, r) | T.null r -> []
+    (Nothing, _) -> []
+    (Just lastIn, r) ->
+      [ Post
+          { author = who,
+            addr = author lastIn,
+            channel = channel lastIn,
+            body = r
+          }
+      ]
+
+-- | Opaque evaluate seat: any @Text -> IO Text@ behind list ends.
+--
+-- Commit assembles a session prompt from the input posts; emit is
+-- 'replyPosts' of the query result (empty = quiet).  Used by 'oneshotShard'
+-- (hermes) and 'echoShard' (mock).
+queryShard :: Text -> (Text -> IO Text) -> IO (Shard IO)
+queryShard who query = do
+  outbox <- newIORef []
+  pure $
+    shard
+      ( \ins ->
+          if null ins
+            then writeIORef outbox []
+            else do
+              reply <- query (sessionPrompt ins)
+              writeIORef outbox (replyPosts who ins reply)
+      )
+      (atomicModifyIORef' outbox (\os -> ([], os)))
+
+-- | Oneshot CLI agent (hermes by default) as a list 'Shard'.
+--
+-- Session file and process stay inside @IO@ — apply-only at this boundary.
+-- @who@ is the agent nick (author on emitted posts).
+oneshotShard :: AgentConfig -> Text -> IO (Shard IO)
+oneshotShard cfg who = queryShard who (agentQuery cfg)
+
+-- | Mock seat: reply body is the session prompt (echo).
+--
+-- Demonstrates the living-agent path without hermes.
+echoShard :: Text -> IO (Shard IO)
+echoShard who = queryShard who pure
+
+-- | One closed shard turn: commit @ins@, emit replies.
+runShard :: Shard IO -> [Post] -> IO [Post]
+runShard sh ins =
+  runKleisli (close (conjoint sh) (companion sh)) ins

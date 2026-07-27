@@ -5,12 +5,16 @@
 -- | Generalised repl connector.
 --
 -- Treat any agent CLI — @hermes chat -q@, @cabal repl@, a future @grok@ TUI —
--- as the same shape: an In buffer that locks the repl loop and triggers
--- evaluation, and an Out buffer that collects prints until a boundary.
+-- as the same shape: an 'Ends' seat that locks the repl loop and triggers
+-- evaluation, and an emit that collects prints until a boundary.
 --
 -- The connector owns both the muster bus attachment and the persistent
 -- process. Addressed messages become commands; collected output is posted
 -- back as framed messages.
+--
+-- Process turn is driven through a dual-seat 'ProcessSeat': 'psOut' and
+-- 'psErr' share stdin ('In'); emit each companion independently. Commit once
+-- per turn via 'psOut'. Bus attach is product-native ('Muster.Channel').
 module Muster.Connector
   ( ConnectorConfig (..),
     defaultConnectorConfig,
@@ -18,8 +22,13 @@ module Muster.Connector
   )
 where
 
-import Circuit.Ends (Ends (..), HasUnit (..), In (..), Out (..), commit, emit)
-import Circuit.Repl (ProcessPorts (..), ReplConfig (..), defaultReplConfig, openProcessPorts)
+import Circuit.Agent.Process
+  ( ProcessSeat (..),
+    ReplConfig (..),
+    defaultReplConfig,
+    openProcessSeat,
+  )
+import Circuit.Ends (Ends (..), HasUnit (..), commit, emit, open)
 import Control.Arrow (Kleisli (..), runKleisli)
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
@@ -28,7 +37,7 @@ import Data.Text qualified as T
 import Muster.Agent (addressedTo, stripAddress)
 import Muster.Channel (Channel, ChannelConfig (..), channelAttach, channelClose, channelRecv, channelSend, defaultChannelConfig)
 import Muster.Config qualified as Config
-import System.Directory (removePathForcibly)
+import System.Directory (createDirectoryIfMissing, removePathForcibly)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import Prelude
@@ -77,7 +86,10 @@ runConnector cfg = do
           }
   ch <- channelAttach chanCfg
   dir <- Config.connectorSessionDir (connName cfg) (connChannel cfg) (connProject cfg)
+  -- Wipe prior session files, then re-create the directory so process open
+  -- can mkfifo stdin and open log paths under it.
   removePathForcibly dir
+  createDirectoryIfMissing True dir
   let replCfg =
         defaultReplConfig
           { replCommand = connCommand cfg,
@@ -87,20 +99,20 @@ runConnector cfg = do
             replStdoutPath = dir </> "stdout.md",
             replStderrPath = dir </> "stderr.md"
           }
-  pp <- openProcessPorts replCfg
+  seat <- openProcessSeat replCfg
   channelSend ch $ "starting persistent repl: " <> T.pack (connCommand cfg) <> " " <> T.unwords (map T.pack (connArgs cfg)) <> " in " <> T.pack (connProject cfg)
-  startup <- emitOutUntil (connBoundary cfg) (connStartupTimeout cfg) pp >>= \case
+  startup <- emitUntil (connBoundary cfg) (connStartupTimeout cfg) (psOut seat) >>= \case
     Nothing -> do
       hPutStrLn stderr "connector: timed out waiting for initial prompt"
       pure []
     Just ls -> pure ls
-  err0 <- emitErr pp
+  err0 <- emitPoll (psErr seat)
   postOutput ch 0 startup err0
-  loop ch pp 1
+  loop ch seat 1
   channelClose ch
-  peClose pp
+  psClose seat
   where
-    loop ch pp turn = do
+    loop ch seat turn = do
       msgs <-
         try @SomeException (channelRecv ch) >>= \case
           Left err -> do
@@ -110,18 +122,18 @@ runConnector cfg = do
       case msgs of
         [] -> do
           threadDelay 500_000
-          loop ch pp turn
+          loop ch seat turn
         _ -> do
-          done <- processMessages cfg ch pp turn msgs
+          done <- processMessages cfg ch seat turn msgs
           if done
             then channelSend ch "quit received; closing"
-            else loop ch pp (turn + length msgs)
+            else loop ch seat (turn + length msgs)
 
-processMessages :: ConnectorConfig -> Channel -> ProcessPorts [Text] [Text] [Text] -> Int -> [(Text, Text)] -> IO Bool
+processMessages :: ConnectorConfig -> Channel -> ProcessSeat [Text] [Text] [Text] -> Int -> [(Text, Text)] -> IO Bool
 processMessages _ _ _ _ [] = pure False
-processMessages cfg ch pp turn ((sender, body) : rest) = do
+processMessages cfg ch seat turn ((sender, body) : rest) = do
   if sender == connName cfg
-    then processMessages cfg ch pp (turn + 1) rest
+    then processMessages cfg ch seat (turn + 1) rest
     else do
       if addressedTo (connName cfg) body
         then do
@@ -131,16 +143,17 @@ processMessages cfg ch pp turn ((sender, body) : rest) = do
             else do
               hPutStrLn stderr $ "connector exec turn " <> show turn <> ": " <> T.unpack (T.take 100 cmd)
               channelSend ch $ "exec turn " <> T.pack (show turn) <> ": " <> cmd
-              commitLines pp [cmd]
-              outLines <- emitOutUntil (connBoundary cfg) (connCommandTimeout cfg) pp >>= \case
+              -- one commit path (shared In); emit both seats
+              commitLines (psOut seat) [cmd]
+              outLines <- emitUntil (connBoundary cfg) (connCommandTimeout cfg) (psOut seat) >>= \case
                 Nothing -> do
                   hPutStrLn stderr "connector: no new prompt; continuing"
                   pure []
                 Just ls -> pure ls
-              errLines <- emitErr pp
+              errLines <- emitPoll (psErr seat)
               postOutput ch turn outLines errLines
-              processMessages cfg ch pp (turn + 1) rest
-        else processMessages cfg ch pp (turn + 1) rest
+              processMessages cfg ch seat (turn + 1) rest
+        else processMessages cfg ch seat (turn + 1) rest
 
 postOutput :: Channel -> Int -> [Text] -> [Text] -> IO ()
 postOutput ch turn outLines errLines = do
@@ -148,26 +161,25 @@ postOutput ch turn outLines errLines = do
       body = T.unlines $ [outHeader, "", "-- stdout --"] <> outLines <> ["", "-- stderr --"] <> errLines
   channelSend ch body
 
-commitLines :: ProcessPorts [Text] [Text] [Text] -> [Text] -> IO ()
-commitLines pp ts = runKleisli (commit (peIn pp) outU) ts
+-- | Commit lines through a seat conjoint (shared stdin).
+commitLines :: Ends (Kleisli IO) [Text] [Text] -> [Text] -> IO ()
+commitLines e ts = runKleisli (commit (conjoint e) outU) ts
   where
     Ends _ outU = open
 
-emitOut :: ProcessPorts [Text] [Text] [Text] -> IO [Text]
-emitOut pp = runKleisli (emit (peOut pp) inU) ()
+-- | One poll emit through a seat companion.
+emitPoll :: Ends (Kleisli IO) [Text] [Text] -> IO [Text]
+emitPoll e = runKleisli (emit (companion e) inU) ()
   where
     Ends inU _ = open
 
-emitErr :: ProcessPorts [Text] [Text] [Text] -> IO [Text]
-emitErr pp = runKleisli (emit (peErr pp) inU) ()
-  where
-    Ends inU _ = open
-
-emitOutUntil :: (Text -> Bool) -> Int -> ProcessPorts [Text] [Text] [Text] -> IO (Maybe [Text])
-emitOutUntil p t pp = go 0 [] 10000
+-- | Poll emit until boundary predicate or timeout (microseconds).
+-- Used on the stdout seat (prompt boundary lives on stdout).
+emitUntil :: (Text -> Bool) -> Int -> Ends (Kleisli IO) [Text] [Text] -> IO (Maybe [Text])
+emitUntil p t e = go 0 [] 10000
   where
     go elapsed acc delay = do
-      news <- emitOut pp
+      news <- emitPoll e
       let acc' = acc <> news
       if any p news
         then pure (Just acc')
@@ -179,4 +191,3 @@ emitOutUntil p t pp = go 0 [] 10000
               threadDelay delay
               let delay' = min 500000 (floor (fromIntegral delay * 1.5 :: Double))
               go elapsed' acc' delay'
-

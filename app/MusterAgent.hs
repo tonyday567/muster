@@ -27,7 +27,6 @@ module Main (main) where
 import Control.Concurrent (Chan, newChan, readChan, threadDelay, writeChan)
 import Control.Concurrent.Async (Async, async, cancel)
 import Control.Exception (SomeException, bracket, try)
-import Control.Monad (foldM, forever, unless, void, when)
 import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
@@ -36,8 +35,26 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Muster.Agent (AgentConfig (..), AgentMode (..), addressedTo, agentQuery, defaultAgentConfig, stripAddress)
-import Muster.Channel (Channel, ChannelConfig (..), channelAttach, channelRecv, defaultChannelConfig)
+import Control.Monad (foldM, forM_, forever, unless, void, when)
+import Muster.Agent
+  ( AgentConfig (..),
+    AgentMode (..),
+    Post (..),
+    Shard,
+    addressedTo,
+    defaultAgentConfig,
+    oneshotShard,
+    runShard,
+    stripAddress,
+  )
+import Muster.Channel
+  ( Channel,
+    ChannelConfig (..),
+    channelAttach,
+    channelRecv,
+    channelSend,
+    defaultChannelConfig,
+  )
 import Muster.Connector (ConnectorConfig (..), defaultConnectorConfig, runConnector)
 import Options.Applicative
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
@@ -245,11 +262,15 @@ main = do
 runOneShot :: MusterAgentConfig -> IO ()
 runOneShot cfg = do
   let agentCfg = toAgentConfig cfg
+      who = T.pack (maName cfg)
+  -- One living seat for the process: Shard IO, session opacity inside.
+  seat <- oneshotShard agentCfg who
   wakeQueue <- newChan
   -- Ensure agent output directory exists.
   adir <- agentDir cfg
   createDirectoryIfMissing True adir
   logErr "scanning for joined channels..."
+  logErr "  seat: oneshot Shard IO (circuits-agent)"
   let go :: Map String Channel -> Map String (Async ()) -> IO ()
       go channels watchers = do
         newChannels <- refreshChannels cfg channels
@@ -268,7 +289,7 @@ runOneShot cfg = do
               Just ch -> do
                 msgs <- channelRecv ch
                 unless (null msgs) $
-                  mapM_ (\(s, b) -> handleMessage agentCfg cfg (channelName, s, b)) msgs
+                  mapM_ (\(s, b) -> handleMessage seat cfg ch (channelName, s, b)) msgs
                 go newChannels newWatchers
   go Map.empty Map.empty
 
@@ -380,30 +401,48 @@ runPersistent cfg = do
               }
       runConnector connCfg
 
-handleMessage :: AgentConfig -> MusterAgentConfig -> (String, Text, Text) -> IO ()
-handleMessage agentCfg cfg (channel, sender, body) = do
+-- | Wake → addressed message → 'runShard' → post reply on the bus.
+--
+-- Bus attach/watch/re-arm stay as they are.  Only evaluate is the Shard seat.
+handleMessage ::
+  Shard IO ->
+  MusterAgentConfig ->
+  Channel ->
+  (String, Text, Text) ->
+  IO ()
+handleMessage seat cfg ch (channel, sender, rawBody) = do
   let name = T.pack (maName cfg)
-  when (sender /= name && addressedTo name body) do
-    let task = stripAddress name body
+  when (sender /= name && addressedTo name rawBody) do
+    let task = stripAddress name rawBody
     logErr $ "  task on #" <> channel <> ": " <> T.unpack (T.take 100 task)
     -- Special meta-commands: agent can join/leave channels on request.
     case parseMetaCommand task of
       Just (Join c) -> runMusterJoin cfg c
       Just (Leave c) -> runMusterLeave cfg c
       Nothing -> do
-        er <- try @SomeException (agentQuery agentCfg task)
+        let chanT = T.pack channel
+            pIn =
+              Post
+                { author = sender,
+                  addr = name,
+                  channel = chanT,
+                  body = task
+                }
+        er <- try @SomeException (runShard seat [pIn])
         case er of
           Left err -> logErr $ "  agent error: " <> show err
-          Right reply -> do
-            let lines' = filter (not . T.null) $ map T.strip $ T.lines reply
-            if null lines'
-              then logErr "  (empty agent reply)"
+          Right outs -> do
+            if null outs
+              then logErr "  (empty agent reply / quiet)"
               else do
-                -- Write agent output to its own bucket file.
                 adir <- agentDir cfg
                 let outPath = adir </> "output.md"
-                logErr $ "  writing output to " <> outPath
-                TIO.appendFile outPath (T.unlines lines')
+                forM_ outs $ \o -> do
+                  let reply = body o
+                  logErr $ "  emit on #" <> channel <> ": " <> T.unpack (T.take 100 reply)
+                  TIO.appendFile outPath (reply <> "\n")
+                  -- Wire emit back to the tape (same channel the wake came from).
+                  void $ try @SomeException (channelSend ch reply)
 
 -- ---------------------------------------------------------------------------
 -- Meta-commands

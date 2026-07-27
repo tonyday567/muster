@@ -4,7 +4,7 @@
 --
 -- One format: @[timestamp] sender: body@.
 --
--- Re-exported from 'Circuit.Comm.Framing' so that circuits-repl and muster
+-- Re-exported from 'Circuit.Agent.Framing' so that circuits-agent and muster
 -- share a single source of truth for framing.
 module Muster.Framing
   ( frameMessage,
@@ -14,4 +14,4 @@ module Muster.Framing
   )
 where
 
-import Circuit.Comm.Framing (formatNow, frameMessage, parseMessage, parseMessageTs)
+import Circuit.Agent.Framing (formatNow, frameMessage, parseMessage, parseMessageTs)

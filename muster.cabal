@@ -78,7 +78,7 @@ library
         base,
         async,
         circuits >=0.1.0.0 && <0.4,
-        circuits-repl,
+        circuits-agent,
         containers,
         directory,
         filepath,
@@ -141,6 +141,54 @@ executable muster-agent
 
     default-language: GHC2021
 
+executable muster-seat-verify
+    import:           warnings
+
+    main-is:          seat-verify.hs
+
+    build-depends:
+        base,
+        directory,
+        muster,
+        text
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
+-- Manual hermes smoke for a single live seat. Not CI / not observe pipelines.
+executable muster-hermes-seat-smoke
+    import:           warnings
+
+    main-is:          hermes-seat-smoke.hs
+
+    build-depends:
+        base,
+        directory,
+        muster,
+        text
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
+-- Multi-round dialogue smoke: pure–pure (default), pure–hermes, hermes–hermes.
+-- Not CI; hermes tiers exit 2 if hermes missing/fails.
+executable muster-multi-round-smoke
+    import:           warnings
+
+    main-is:          multi-round-smoke.hs
+
+    build-depends:
+        base,
+        directory,
+        muster,
+        text
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
 executable muster-ws
     import:           warnings
 
@@ -152,7 +200,7 @@ executable muster-ws
         base,
         async,
         bytestring,
-        circuits-repl,
+        circuits-agent,
         containers,
         file-embed,
         http-types,
