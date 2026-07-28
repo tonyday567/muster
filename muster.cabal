@@ -72,6 +72,7 @@ library
         Muster.Cursor
         Muster.Framing
         Muster.Agent
+        Muster.Agent.Seat
         Muster.Connector
 
     build-depends:
@@ -129,13 +130,15 @@ executable muster-agent
     build-depends:
         base,
         muster,
+        circuits-agent,
         optparse-applicative,
         text,
         async,
         containers,
         directory,
         filepath,
-        process
+        process,
+        stm
 
     hs-source-dirs:   app
 
@@ -178,6 +181,43 @@ executable muster-multi-round-smoke
     import:           warnings
 
     main-is:          multi-round-smoke.hs
+
+    build-depends:
+        base,
+        directory,
+        muster,
+        text
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
+-- Composed seat pipeline smoke (no hermes, no live bus daemon).
+executable muster-agent-pipeline-smoke
+    import:           warnings
+
+    main-is:          agent-pipeline-smoke.hs
+
+    build-depends:
+        base,
+        circuits-agent,
+        directory,
+        filepath,
+        muster,
+        async,
+        containers,
+        stm,
+        text
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
+-- Bus-as-topology smoke: panel of experts + synthesizer on a shared log.
+executable muster-bus-composition-smoke
+    import:           warnings
+
+    main-is:          bus-composition-smoke.hs
 
     build-depends:
         base,

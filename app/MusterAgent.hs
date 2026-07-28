@@ -6,15 +6,21 @@
 -- channels.
 --
 -- Agents are symmetric to human participants: they are joined to channels
--- explicitly via `muster join <agent> -c <channel>`.  The agent scans the
+-- explicitly via `muster join <agent> -c <channel>`. The agent scans the
 -- bus root for `.cursor-<name>` files and attaches to every channel where it
 -- has been joined.
 --
 -- Two modes:
 --
---   * __oneshot__: runs @\<agent\> chat -q \<prompt\>@ for each addressed message.
+--   * __oneshot__: runs @<agent> chat -q <prompt>@ for each addressed message.
 --   * __persistent__: keeps a single repl process alive (e.g. @cabal repl@)
 --     on the agent's primary/default channel.
+--
+-- The oneshot path is a composed pipeline of 'circuits-agent' seats:
+--
+-- @
+--   wake → filter → meta → main → bus → bucket → diag
+-- @
 --
 -- Usage:
 --
@@ -24,28 +30,44 @@
 -- @
 module Main (main) where
 
+import Circuit.Agent ((>:>))
 import Control.Concurrent (Chan, newChan, readChan, threadDelay, writeChan)
 import Control.Concurrent.Async (Async, async, cancel)
+import Control.Concurrent.STM
+  ( TChan,
+    TQueue,
+    atomically,
+    newTChanIO,
+    newTQueueIO,
+    readTQueue,
+    tryReadTChan,
+    writeTQueue,
+  )
 import Control.Exception (SomeException, bracket, try)
+import Control.Monad (foldM, forever, unless, void, when)
 import Data.List (sort)
-import Data.Maybe (fromMaybe)
-import Data.Set qualified as Set
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Control.Monad (foldM, forM_, forever, unless, void, when)
 import Muster.Agent
   ( AgentConfig (..),
     AgentMode (..),
     Post (..),
     Shard,
-    addressedTo,
     defaultAgentConfig,
     oneshotShard,
     runShard,
-    stripAddress,
+  )
+import Muster.Agent.Seat
+  ( MetaAction (..),
+    bucketShard,
+    busSink,
+    diagShard,
+    filterShard,
+    metaShard,
   )
 import Muster.Channel
   ( Channel,
@@ -241,6 +263,20 @@ projectDir cfg = case maProject cfg of
   Nothing -> (</> "haskell" </> "circuits") <$> getHomeDirectory
 
 -- ---------------------------------------------------------------------------
+-- Diagnostics sink
+-- ---------------------------------------------------------------------------
+
+-- | Write one diagnostic line to the queue.
+diagLine :: TQueue Text -> String -> IO ()
+diagLine q msg = atomically (writeTQueue q (T.pack msg))
+
+-- | Drain the diagnostic queue to stderr forever.
+startDiagDrain :: TQueue Text -> IO ()
+startDiagDrain q = void $ async $ forever $ do
+  msg <- atomically $ readTQueue q
+  TIO.hPutStrLn stderr msg
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
@@ -249,55 +285,131 @@ main = do
   cfg <- execParser optsInfo
   let filter' = if null (maFilter cfg) then "@" <> maName cfg else maFilter cfg
       cfg' = cfg {maFilter = filter'}
-
-  logErr $ "muster-agent [" <> maName cfg' <> "] starting"
-  logErr $ "  mode: " <> show (maMode cfg')
-  logErr $ "  agent command: " <> maAgent cfg'
-  logErr $ "  filter: " <> maFilter cfg'
-
+  diagQ <- newTQueueIO
+  startDiagDrain diagQ
+  diagLine diagQ $ "muster-agent [" <> maName cfg' <> "] starting"
+  diagLine diagQ $ "  mode: " <> show (maMode cfg')
+  diagLine diagQ $ "  agent command: " <> maAgent cfg'
+  diagLine diagQ $ "  filter: " <> maFilter cfg'
   case maMode cfg' of
-    OneShot -> runOneShot cfg'
+    OneShot -> runOneShot diagQ cfg'
     Persistent -> runPersistent cfg'
 
-runOneShot :: MusterAgentConfig -> IO ()
-runOneShot cfg = do
+runOneShot :: TQueue Text -> MusterAgentConfig -> IO ()
+runOneShot diagQ cfg = do
   let agentCfg = toAgentConfig cfg
       who = T.pack (maName cfg)
-  -- One living seat for the process: Shard IO, session opacity inside.
-  seat <- oneshotShard agentCfg who
-  wakeQueue <- newChan
-  -- Ensure agent output directory exists.
+      diag = diagLine diagQ
+  mainSeat <- oneshotShard agentCfg who
+  metaChan <- newTChanIO
   adir <- agentDir cfg
   createDirectoryIfMissing True adir
-  logErr "scanning for joined channels..."
-  logErr "  seat: oneshot Shard IO (circuits-agent)"
+  let outPath = adir </> "output.md"
+  wakeQueue <- newChan
+  diag "scanning for joined channels..."
+  diag "  seat: oneshot Shard IO (circuits-agent)"
   let go :: Map String Channel -> Map String (Async ()) -> IO ()
       go channels watchers = do
-        newChannels <- refreshChannels cfg channels
-        newWatchers <- refreshWatchers cfg wakeQueue watchers newChannels
-        -- Avoid deadlock: if no channels are joined, sleep and rescan
-        -- rather than blocking indefinitely on an empty wakeQueue.
-        if Map.null newChannels
+        newChannels <- refreshChannels diag cfg channels
+        -- Drain any meta actions produced by the previous turn; refresh
+        -- channels and restart watchers if they changed.
+        channelsAfterMeta <- drainMeta diagQ cfg metaChan newChannels
+        if Map.keysSet channelsAfterMeta /= Map.keysSet newChannels
           then do
-            logErr "  no channels joined; sleeping 5s before rescan..."
-            threadDelay 5_000_000
-            go newChannels newWatchers
+            mapM_ cancel (Map.elems watchers)
+            go channelsAfterMeta Map.empty
           else do
-            channelName <- readChan wakeQueue
-            case Map.lookup channelName newChannels of
-              Nothing -> go newChannels newWatchers
-              Just ch -> do
-                msgs <- channelRecv ch
-                unless (null msgs) $
-                  mapM_ (\(s, b) -> handleMessage seat cfg ch (channelName, s, b)) msgs
+            newWatchers <- refreshWatchers diag cfg wakeQueue watchers newChannels
+            if Map.null newChannels
+              then do
+                diag "  no channels joined; sleeping 5s before rescan..."
+                threadDelay 5_000_000
                 go newChannels newWatchers
+              else do
+                channelName <- readChan wakeQueue
+                case Map.lookup channelName newChannels of
+                  Nothing -> go newChannels newWatchers
+                  Just ch -> do
+                    msgs <- channelRecv ch
+                    unless (null msgs) $
+                      mapM_ (\(s, b) -> handleWake diagQ who outPath mainSeat metaChan newChannels (channelName, s, b)) msgs
+                    go newChannels newWatchers
   go Map.empty Map.empty
 
--- | Refresh the set of attached channels.  Returns a map from channel name to
--- open handle, attaching to any newly-joined channels and dropping any whose
--- cursor files have disappeared.
-refreshChannels :: MusterAgentConfig -> Map String Channel -> IO (Map String Channel)
-refreshChannels cfg old = do
+-- | Drain meta actions from the pipeline and refresh the channel map.
+drainMeta ::
+  TQueue Text ->
+  MusterAgentConfig ->
+  TChan MetaAction ->
+  Map String Channel ->
+  IO (Map String Channel)
+drainMeta diagQ cfg metaChan channels = do
+  let diag = diagLine diagQ
+  mAct <- atomically (tryReadTChan metaChan)
+  case mAct of
+    Nothing -> pure channels
+    Just act -> do
+      channels' <- case act of
+        JoinChannel c -> do
+          diag $ "  meta: joining #" <> c
+          runMusterJoin diag cfg c
+          refreshChannels diag cfg channels
+        LeaveChannel _ -> do
+          diag "  meta: leaving current channel"
+          runMusterLeave diag cfg ""
+          refreshChannels diag cfg channels
+      drainMeta diagQ cfg metaChan channels'
+
+-- | Build the oneshot pipeline for the current channel map.
+--
+-- The main seat is supplied from outside so its hermes session state survives
+-- channel refreshes.
+buildPipeline ::
+  Text ->
+  TQueue Text ->
+  FilePath ->
+  TChan MetaAction ->
+  Map String Channel ->
+  Shard IO ->
+  IO (Shard IO)
+buildPipeline who diagQ outPath metaChan channels mainSeat = do
+  f <- filterShard who
+  m <- metaShard metaChan diagQ
+  b <- busSink (Map.mapKeys T.pack (Map.map channelSend channels))
+  buck <- bucketShard outPath
+  d <- diagShard diagQ
+  pure (f >:> m >:> mainSeat >:> b >:> buck >:> d)
+
+-- | Wake → addressed message → run pipeline → bus + bucket + diag.
+handleWake ::
+  TQueue Text ->
+  Text ->
+  FilePath ->
+  Shard IO ->
+  TChan MetaAction ->
+  Map String Channel ->
+  (String, Text, Text) ->
+  IO ()
+handleWake diagQ who outPath mainSeat metaChan channels (channel, sender, rawBody) = do
+  let diag = diagLine diagQ
+  diag $ "  task on #" <> channel <> ": " <> T.unpack (T.take 100 rawBody)
+  pipeline <- buildPipeline who diagQ outPath metaChan channels mainSeat
+  let pIn =
+        Post
+          { author = sender,
+            addr = who,
+            channel = T.pack channel,
+            body = rawBody
+          }
+  void $ try @SomeException (runShard pipeline [pIn])
+
+-- | Refresh the set of attached channels.
+refreshChannels ::
+  (String -> IO ()) ->
+  MusterAgentConfig ->
+  Map String Channel ->
+  IO (Map String Channel)
+refreshChannels diag cfg old = do
   names <- discoveredChannels cfg
   let addNew acc name =
         case Map.lookup name acc of
@@ -307,40 +419,38 @@ refreshChannels cfg old = do
             res <- try @SomeException (channelAttach chanCfg)
             case res of
               Left err -> do
-                logErr $ "  failed to attach to #" <> name <> ": " <> show err
+                diag $ "  failed to attach to #" <> name <> ": " <> show err
                 pure acc
               Right ch -> do
-                logErr $ "  joined #" <> name
-                -- drain backlog so we don't react to old messages
+                diag $ "  joined #" <> name
                 _ <- channelRecv ch
                 pure (Map.insert name ch acc)
   added <- foldM addNew old names
-  -- Remove channels whose cursor disappeared
   let current = Set.fromList names
       stale = Map.keysSet added `Set.difference` current
   unless (Set.null stale) $
-    logErr $ "  left channels: " <> unwords (Set.toList stale)
+    diag $ "  left channels: " <> unwords (Set.toList stale)
   pure (foldr Map.delete added (Set.toList stale))
 
 -- | Start alert watchers for newly-joined channels and cancel watchers for
--- channels that have been left.  Each watcher runs @muster-alert -c <channel>
--- <filter> <name>@ in a loop, signalling the main thread on every addressed post.
+-- channels that have been left.
 refreshWatchers ::
+  (String -> IO ()) ->
   MusterAgentConfig ->
   Chan String ->
   Map String (Async ()) ->
   Map String Channel ->
   IO (Map String (Async ()))
-refreshWatchers cfg wakeQueue old channels = do
+refreshWatchers diag cfg wakeQueue old channels = do
   let current = Set.fromList (Map.keys channels)
       stale = Map.keysSet old `Set.difference` current
       newNames = Set.toList (current `Set.difference` Map.keysSet old)
   mapM_ cancel (Map.elems (Map.filterWithKey (\k _ -> Set.member k stale) old))
-  added <- mapM (\name -> (name,) <$> async (alertWatcher cfg wakeQueue name)) newNames
+  added <- mapM (\name -> (name,) <$> async (alertWatcher diag cfg wakeQueue name)) newNames
   pure $ Map.union (Map.difference old (Map.fromSet (const ()) stale)) (Map.fromList added)
 
-alertWatcher :: MusterAgentConfig -> Chan String -> String -> IO ()
-alertWatcher cfg wakeQueue channel = forever $ do
+alertWatcher :: (String -> IO ()) -> MusterAgentConfig -> Chan String -> String -> IO ()
+alertWatcher diag cfg wakeQueue channel = forever $ do
   res <- try @SomeException $
     bracket (startAlert cfg channel) stopAlert $ \(h, _) -> do
       hSetBuffering h LineBuffering
@@ -352,13 +462,12 @@ alertWatcher cfg wakeQueue channel = forever $ do
         writeChan wakeQueue channel
   case res of
     Left err -> do
-      logErr $ "  watcher for #" <> channel <> " died: " <> show err
+      diag $ "  watcher for #" <> channel <> " died: " <> show err
       threadDelay 1_000_000
     Right _ -> pure ()
 
 startAlert :: MusterAgentConfig -> String -> IO (Handle, ProcessHandle)
 startAlert cfg channel = do
-  -- Filter defaults to @<name> — only wake on addressed messages.
   let rootArgs = case maBusRoot cfg of
         "" -> []
         r -> ["-r", r]
@@ -386,10 +495,10 @@ runPersistent cfg = do
   channels <- discoveredChannels cfg
   case channels of
     [] -> do
-      logErr "no channels joined for persistent agent — run 'muster join <name> -c <channel>' first"
+      TIO.hPutStrLn stderr "no channels joined for persistent agent — run 'muster join <name> -c <channel>' first"
       exitWith (ExitFailure 1)
     (primary : _) -> do
-      logErr $ "persistent mode using primary channel #" <> primary
+      TIO.hPutStrLn stderr $ "persistent mode using primary channel #" <> T.pack primary
       project <- projectDir cfg
       let connCfg =
             (defaultConnectorConfig (T.pack (maName cfg)))
@@ -401,73 +510,19 @@ runPersistent cfg = do
               }
       runConnector connCfg
 
--- | Wake → addressed message → 'runShard' → post reply on the bus.
---
--- Bus attach/watch/re-arm stay as they are.  Only evaluate is the Shard seat.
-handleMessage ::
-  Shard IO ->
-  MusterAgentConfig ->
-  Channel ->
-  (String, Text, Text) ->
-  IO ()
-handleMessage seat cfg ch (channel, sender, rawBody) = do
-  let name = T.pack (maName cfg)
-  when (sender /= name && addressedTo name rawBody) do
-    let task = stripAddress name rawBody
-    logErr $ "  task on #" <> channel <> ": " <> T.unpack (T.take 100 task)
-    -- Special meta-commands: agent can join/leave channels on request.
-    case parseMetaCommand task of
-      Just (Join c) -> runMusterJoin cfg c
-      Just (Leave c) -> runMusterLeave cfg c
-      Nothing -> do
-        let chanT = T.pack channel
-            pIn =
-              Post
-                { author = sender,
-                  addr = name,
-                  channel = chanT,
-                  body = task
-                }
-        er <- try @SomeException (runShard seat [pIn])
-        case er of
-          Left err -> logErr $ "  agent error: " <> show err
-          Right outs -> do
-            if null outs
-              then logErr "  (empty agent reply / quiet)"
-              else do
-                adir <- agentDir cfg
-                let outPath = adir </> "output.md"
-                forM_ outs $ \o -> do
-                  let reply = body o
-                  logErr $ "  emit on #" <> channel <> ": " <> T.unpack (T.take 100 reply)
-                  TIO.appendFile outPath (reply <> "\n")
-                  -- Wire emit back to the tape (same channel the wake came from).
-                  void $ try @SomeException (channelSend ch reply)
-
 -- ---------------------------------------------------------------------------
 -- Meta-commands
 -- ---------------------------------------------------------------------------
 
-data MetaCommand = Join String | Leave String
-
-parseMetaCommand :: Text -> Maybe MetaCommand
-parseMetaCommand t =
-  let low = T.toLower $ T.strip t
-      stripHash c = fromMaybe c (T.stripPrefix "#" c)
-   in case T.words low of
-        ["join", c] -> Just (Join (T.unpack (stripHash c)))
-        ["leave", c] -> Just (Leave (T.unpack (stripHash c)))
-        _ -> Nothing
-
-runMusterJoin :: MusterAgentConfig -> String -> IO ()
-runMusterJoin cfg channel = do
-  logErr $ "  joining #" <> channel
+runMusterJoin :: (String -> IO ()) -> MusterAgentConfig -> String -> IO ()
+runMusterJoin diag cfg channel = do
+  diag $ "  joining #" <> channel
   void $ try @SomeException $ runMuster cfg ["name", maName cfg]
   void $ try @SomeException $ runMuster cfg ["join", channel]
 
-runMusterLeave :: MusterAgentConfig -> String -> IO ()
-runMusterLeave cfg _channel = do
-  logErr "  leaving current channel"
+runMusterLeave :: (String -> IO ()) -> MusterAgentConfig -> String -> IO ()
+runMusterLeave diag cfg _channel = do
+  diag "  leaving current channel"
   void $ try @SomeException $ runMuster cfg ["leave"]
 
 runMuster :: MusterAgentConfig -> [String] -> IO ()
@@ -479,6 +534,3 @@ runMuster cfg args = do
   (_, _, _, ph) <- createProcess cmd
   _ <- waitForProcess ph
   pure ()
-
-logErr :: String -> IO ()
-logErr = TIO.hPutStrLn stderr . T.pack

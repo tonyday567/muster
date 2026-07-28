@@ -4,6 +4,7 @@ packages:
   ../circuits/circuits.cabal
   ../circuits-ad/circuits-ad.cabal
   ../circuits-poly/circuits-poly.cabal
+  ../circuits-parser/circuits-parser.cabal
   ../harpie/harpie.cabal
   ../harpie-numhask/harpie-numhask.cabal
   ../numhask/numhask.cabal
