@@ -229,6 +229,22 @@ executable muster-bus-composition-smoke
 
     default-language: GHC2021
 
+-- Panel topology smoke: N agents × R rounds + synthesis.
+executable muster-panel-smoke
+    import:           warnings
+
+    main-is:          panel-smoke.hs
+
+    build-depends:
+        base,
+        directory,
+        muster,
+        text
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
 executable muster-ws
     import:           warnings
 
