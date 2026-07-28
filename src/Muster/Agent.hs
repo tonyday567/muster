@@ -243,7 +243,7 @@ cleanAgentOut =
        in T.all ok t
 
 -- ---------------------------------------------------------------------------
--- Living agent as Shard IO (seat, not rewrite)
+-- Living agent as Shard IO [Post] (seat, not rewrite)
 -- ---------------------------------------------------------------------------
 
 -- | Session assembly for the opaque seat: bodies, oldest-first, one per line.
@@ -276,7 +276,7 @@ replyPosts who ins reply =
 -- Commit assembles a session prompt from the input posts; emit is
 -- 'replyPosts' of the query result (empty = quiet).  Used by 'oneshotShard'
 -- (hermes) and 'echoShard' (mock).
-queryShard :: Text -> (Text -> IO Text) -> IO (Shard IO)
+queryShard :: Text -> (Text -> IO Text) -> IO (Shard IO [Post])
 queryShard who query = do
   outbox <- newIORef []
   pure $
@@ -294,16 +294,16 @@ queryShard who query = do
 --
 -- Session file and process stay inside @IO@ — apply-only at this boundary.
 -- @who@ is the agent nick (author on emitted posts).
-oneshotShard :: AgentConfig -> Text -> IO (Shard IO)
+oneshotShard :: AgentConfig -> Text -> IO (Shard IO [Post])
 oneshotShard cfg who = queryShard who (agentQuery cfg)
 
 -- | Mock seat: reply body is the session prompt (echo).
 --
 -- Demonstrates the living-agent path without hermes.
-echoShard :: Text -> IO (Shard IO)
+echoShard :: Text -> IO (Shard IO [Post])
 echoShard who = queryShard who pure
 
 -- | One closed shard turn: commit @ins@, emit replies.
-runShard :: Shard IO -> [Post] -> IO [Post]
+runShard :: Shard IO [Post] -> [Post] -> IO [Post]
 runShard sh ins =
   runKleisli (close (conjoint sh) (companion sh)) ins

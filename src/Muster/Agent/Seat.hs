@@ -73,7 +73,7 @@ parseMetaAction t =
 -- | Keep only posts addressed to @who@, stripping the addressing prefix.
 --
 -- Self-posts and non-addressed posts become quiet (empty emit).
-filterShard :: Text -> IO (Shard IO)
+filterShard :: Text -> IO (Shard IO [Post])
 filterShard who = do
   ref <- newIORef []
   pure $
@@ -91,7 +91,7 @@ filterShard who = do
 --
 -- Meta actions are written to the supplied 'TChan' and logged to the diag
 -- queue; they do not propagate downstream.
-metaShard :: TChan MetaAction -> TQueue Text -> IO (Shard IO)
+metaShard :: TChan MetaAction -> TQueue Text -> IO (Shard IO [Post])
 metaShard acts diag = do
   ref <- newIORef []
   pure $
@@ -118,7 +118,7 @@ metaShard acts diag = do
 --
 -- The map key is the channel name; the value is the send action. Posts are
 -- passed through so downstream seats (bucket, diag) can still see them.
-busSink :: Map Text (Text -> IO ()) -> IO (Shard IO)
+busSink :: Map Text (Text -> IO ()) -> IO (Shard IO [Post])
 busSink sinks = do
   ref <- newIORef []
   pure $
@@ -137,7 +137,7 @@ busSink sinks = do
 -- | Append emitted post bodies to a file.
 --
 -- Passes posts through so a downstream 'diagShard' can log them.
-bucketShard :: FilePath -> IO (Shard IO)
+bucketShard :: FilePath -> IO (Shard IO [Post])
 bucketShard outPath = do
   ref <- newIORef []
   pure $
@@ -151,7 +151,7 @@ bucketShard outPath = do
       )
 
 -- | Terminal seat: log every emitted post to the diag queue.
-diagShard :: TQueue Text -> IO (Shard IO)
+diagShard :: TQueue Text -> IO (Shard IO [Post])
 diagShard diag = do
   ref <- newIORef []
   pure $

@@ -10,7 +10,7 @@
 --
 -- Naming: these are not \"Identity agents\". A pure seat is
 -- @queryShard who (pure . f)@ — Moore-shaped evaluate with a pure @Text -> Text@.
--- @Shard Identity@ is a different (pure Ends) packaging in circuits-agent verify.
+-- @Shard Identity [Post]@ is a different (pure Ends) packaging in circuits-agent verify.
 --
 -- @
 --   cabal run muster-multi-round-smoke
@@ -62,7 +62,7 @@ assert msg ok =
 --
 -- Each step is one closed 'runShard' turn (commit list, emit list). The
 -- conversation is the posts themselves — multi-round, not oneshot-shaped.
-pingPong :: Int -> Shard IO -> Shard IO -> Post -> IO [Post]
+pingPong :: Int -> Shard IO [Post] -> Shard IO [Post] -> Post -> IO [Post]
 pingPong n seatA seatB seed = go n seed []
   where
     go 0 _ acc = pure (reverse acc)
@@ -77,7 +77,7 @@ pingPong n seatA seatB seed = go n seed []
             (b : _) -> go (k - 1) b (b : a : acc)
 
 -- | Pure seat: @Text -> Text@ with no external process.
-pureShard :: Text -> (Text -> Text) -> IO (Shard IO)
+pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post])
 pureShard who f = queryShard who (pure . f)
 
 data Tier = Pure | Mixed | DualHermes | All

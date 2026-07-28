@@ -37,7 +37,7 @@ assert msg ok =
 mkPost :: Text -> Text -> Text -> Text -> Post
 mkPost a d c b = Post a d c b
 
-pureShard :: Text -> (Text -> Text) -> IO (Shard IO)
+pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post])
 pureShard who f = queryShard who (pure . f)
 
 main :: IO ()
