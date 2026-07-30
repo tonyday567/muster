@@ -29,8 +29,8 @@ import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (hPutStrLn, stderr)
 
-mk :: Text -> Text -> Text -> Text -> Post
-mk a d c b = Post a d c b
+mk :: Text -> Text -> Text -> Post
+mk a d = Post a [d]
 
 main :: IO ()
 main = do
@@ -53,7 +53,7 @@ main = do
             cfgAgent = "hermes"
           }
   seat <- oneshotShard cfg who
-  let pIn = mk "human" who "smoke" prompt
+  let pIn = mk "human" who prompt
   er <- try @SomeException (runShard seat [pIn])
   case er of
     Left err -> do

@@ -34,8 +34,8 @@ assert msg ok =
     putStrLn $ "  FAIL " <> msg
     exitFailure
 
-mkPost :: Text -> Text -> Text -> Text -> Post
-mkPost a d c b = Post a d c b
+mkPost :: Text -> Text -> Text -> Post
+mkPost a d = Post a [d]
 
 pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post])
 pureShard who f = queryShard who (pure . f)
@@ -54,7 +54,7 @@ main = do
     void $ ensureChannel root panel
 
     -- Seed: the single prompt every expert sees.
-    let seed = mkPost "human" "panel" "panel" "Q: what should we do?"
+    let seed = mkPost "human" "panel" "Q: what should we do?"
     post root panel human (body seed)
     threadDelay 100_000
 
@@ -73,7 +73,7 @@ main = do
 
     -- Public record: every expert reply is posted to the bus.
     forM_ (aOuts <> bOuts <> gOuts) $ \o ->
-      post root panel (Nick (author o)) (body o)
+      post root panel (Nick (from o)) (body o)
     threadDelay 100_000
 
     -- Synthesizer sees the three replies, not the seed.
@@ -87,7 +87,7 @@ main = do
     assert "synth emits one synthesis" $ length sOuts == 1
 
     -- Post synthesis to the bus.
-    forM_ sOuts $ \o -> post root panel (Nick (author o)) (body o)
+    forM_ sOuts $ \o -> post root panel (Nick (from o)) (body o)
     threadDelay 100_000
 
     -- Verify the public log contains the synthesis.

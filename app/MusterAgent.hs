@@ -396,9 +396,8 @@ handleWake diagQ who outPath mainSeat metaChan channels (channel, sender, rawBod
   pipeline <- buildPipeline who diagQ outPath metaChan channels mainSeat
   let pIn =
         Post
-          { author = sender,
-            addr = who,
-            channel = T.pack channel,
+          { from = sender,
+            to = [who, T.pack channel],
             body = rawBody
           }
   void $ try @SomeException (runShard pipeline [pIn])
@@ -429,7 +428,8 @@ refreshChannels diag cfg old = do
   let current = Set.fromList names
       stale = Map.keysSet added `Set.difference` current
   unless (Set.null stale) $
-    diag $ "  left channels: " <> unwords (Set.toList stale)
+    diag $
+      "  left channels: " <> unwords (Set.toList stale)
   pure (foldr Map.delete added (Set.toList stale))
 
 -- | Start alert watchers for newly-joined channels and cancel watchers for
@@ -472,12 +472,13 @@ startAlert cfg channel = do
         "" -> []
         r -> ["-r", r]
       args = ["-c", channel] ++ rootArgs ++ [maFilter cfg, maName cfg]
-  res <- try @SomeException $
-    createProcess
-      (proc "muster-alert" args)
-        { std_out = CreatePipe,
-          std_err = Inherit
-        }
+  res <-
+    try @SomeException $
+      createProcess
+        (proc "muster-alert" args)
+          { std_out = CreatePipe,
+            std_err = Inherit
+          }
   case res of
     Left err -> fail $ "failed to start muster-alert: " <> show err
     Right (Nothing, Just h, Nothing, ph) -> pure (h, ph)

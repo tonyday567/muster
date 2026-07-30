@@ -11,7 +11,7 @@ module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (forM_, void)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Muster.Agent
   ( Post (..),
@@ -34,8 +34,8 @@ assert msg ok =
       putStrLn ("  FAIL " ++ msg)
       exitFailure
 
-mk :: Text -> Text -> Text -> Text -> Post
-mk a d c b = Post a d c b
+mk :: Text -> Text -> Text -> Post
+mk a d = Post a [d]
 
 -- | Same decode as circuits-agent-observe: channel is the address.
 decodePost :: Channel -> Text -> Maybe Post
@@ -43,9 +43,8 @@ decodePost chan line = do
   (author', body') <- parseMessage line
   pure
     Post
-      { author = author',
-        addr = unChannel chan,
-        channel = unChannel chan,
+      { from = author',
+        to = [unChannel chan],
         body = body'
       }
 
@@ -55,16 +54,15 @@ main = do
 
   putStrLn "session / reply helpers"
   do
-    let p1 = mk "human" "echo" "alpha" "hi"
-        p2 = mk "human" "echo" "alpha" "there"
+    let p1 = mk "human" "echo" "hi"
+        p2 = mk "human" "echo" "there"
     assert "sessionPrompt joins bodies" $
       sessionPrompt [p1, p2] == "hi\nthere"
-    assert "replyPosts addresses last author" $
+    assert "replyPosts addresses last author and preserves wire" $
       case replyPosts "echo" [p1] "ack" of
         [o] ->
-          author o == "echo"
-            && addr o == "human"
-            && channel o == "alpha"
+          from o == "echo"
+            && to o == ["human"]
             && body o == "ack"
         _ -> False
     assert "replyPosts quiet on empty reply" $
@@ -75,15 +73,14 @@ main = do
   putStrLn "echo Shard IO [Post]"
   do
     seat <- echoShard "echo"
-    let pIn = mk "human" "echo" "bus" "ping"
+    let pIn = mk "human" "echo" "ping"
     outs <- runShard seat [pIn]
     assert "one reply post" $ length outs == 1
     assert "body is session prompt (echo)" $ map body outs == ["ping"]
-    assert "author is seat nick" $ all ((== "echo") . author) outs
-    assert "addr is human" $ all ((== "human") . addr) outs
-    assert "channel preserved" $ all ((== "bus") . channel) outs
+    assert "from is seat nick" $ all ((== "echo") . from) outs
+    assert "to is [human]" $ all ((== ["human"]) . to) outs
 
-    outs2 <- runShard seat [mk "k" "echo" "beta" "hi\nline2"]
+    outs2 <- runShard seat [mk "k" "echo" "hi\nline2"]
     assert "multi-line session echoes" $
       map body outs2 == ["hi\nline2"]
 
@@ -117,9 +114,10 @@ main = do
       outs <- runShard seat news
       assert "seat emits echo reply" $ map body outs == ["ping"]
 
-      -- seat emit → tape (post as echo to human's channel via Post.addr)
+      -- seat emit → tape (post as echo to human's channel via Post.to)
       forM_ outs $ \o ->
-        post root (Channel (addr o)) (Nick (author o)) (body o)
+        forM_ (listToMaybe (to o)) $ \name ->
+          post root (Channel name) (Nick (from o)) (body o)
       threadDelay 100_000
 
       humanSeen <- readNext root humanChan human

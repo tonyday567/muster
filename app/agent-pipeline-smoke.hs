@@ -46,8 +46,8 @@ assert msg ok =
     putStrLn $ "  FAIL " <> msg
     exitFailure
 
-mkPost :: Text -> Text -> Text -> Text -> Post
-mkPost a d c b = Post a d c b
+mkPost :: Text -> [Text] -> Text -> Post
+mkPost = Post
 
 main :: IO ()
 main = do
@@ -87,25 +87,25 @@ main = do
 
   -- 1. Addressed post from human on #bus.
   putStrLn "addressed post produces reply"
-  _ <- runShard pipeline [mkPost "human" "echo" "bus" "@echo hello"]
+  _ <- runShard pipeline [mkPost "human" ["echo", "bus"] "@echo hello"]
   bus1 <- readIORef busLog
   assert "reply body is stripped prompt" $ bus1 == ["hello"]
 
   -- 2. Self-post is quiet.
   putStrLn "self post is quiet"
-  _ <- runShard pipeline [mkPost "echo" "echo" "bus" "@echo hi"]
+  _ <- runShard pipeline [mkPost "echo" ["echo", "bus"] "@echo hi"]
   bus2 <- readIORef busLog
   assert "no reply to self post" $ bus2 == ["hello"]
 
   -- 3. Non-addressed post is quiet.
   putStrLn "non-addressed post is quiet"
-  _ <- runShard pipeline [mkPost "human" "echo" "bus" "just chatting"]
+  _ <- runShard pipeline [mkPost "human" ["echo", "bus"] "just chatting"]
   bus3 <- readIORef busLog
   assert "no reply to chatter" $ bus3 == ["hello"]
 
   -- 4. Meta join command produces a MetaAction.
   putStrLn "meta join emits action"
-  _ <- runShard pipeline [mkPost "human" "echo" "bus" "@echo join #test"]
+  _ <- runShard pipeline [mkPost "human" ["echo", "bus"] "@echo join #test"]
   mAct <- atomically $ tryReadTChan metaChan
   assert "meta channel received JoinChannel test" $ mAct == Just (JoinChannel "test")
 
@@ -113,7 +113,7 @@ main = do
   --    and post on the newly joined channel.
   putStrLn "post on refreshed channel produces reply"
   pipeline' <- buildPipeline mainSeat sinks bucketPath diagQ metaChan
-  _ <- runShard pipeline' [mkPost "human" "echo" "test" "@echo ping"]
+  _ <- runShard pipeline' [mkPost "human" ["echo", "test"] "@echo ping"]
   test1 <- readIORef testLog
   assert "reply on #test" $ test1 == ["ping"]
 

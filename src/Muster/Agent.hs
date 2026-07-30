@@ -95,16 +95,18 @@ stripAddress name body =
       tryPrefix prefix =
         let p = prefix <> ":"
          in case T.breakOn p low of
-              (_, r) | not (T.null r) ->
-                let i = T.length body - T.length r + T.length p
-                 in Just (stripAt i)
+              (_, r)
+                | not (T.null r) ->
+                    let i = T.length body - T.length r + T.length p
+                     in Just (stripAt i)
               _ -> Nothing
       tryAt =
         let at = "@" <> n
          in case T.breakOn at low of
-              (_, r) | not (T.null r) ->
-                let i = T.length body - T.length r + T.length at
-                 in Just (T.strip $ T.drop i body)
+              (_, r)
+                | not (T.null r) ->
+                    let i = T.length body - T.length r + T.length at
+                     in Just (T.strip $ T.drop i body)
               _ -> Nothing
    in case tryPrefix n of
         Just rest -> rest
@@ -129,8 +131,10 @@ agentQuery cfg prompt = do
       baseArgs =
         [ cfgAgent cfg <> " chat -q",
           q,
-          "-m", shellQuote model,
-          "--provider", shellQuote provider,
+          "-m",
+          shellQuote model,
+          "--provider",
+          shellQuote provider,
           "--yolo -Q --max-turns 90"
         ]
       resumeArgs sid = baseArgs <> ["--resume", shellQuote sid]
@@ -157,7 +161,8 @@ runFresh :: FilePath -> ([String] -> IO (ExitCode, Text)) -> [String] -> IO Text
 runFresh sessionFile runAgent baseArgs = do
   (code, out) <- runAgent baseArgs
   when (code /= ExitSuccess) $
-    fail $ "agent failed (code " <> show code <> "): " <> T.unpack (T.take 200 out)
+    fail $
+      "agent failed (code " <> show code <> "): " <> T.unpack (T.take 200 out)
   updateSessionFile sessionFile out
   pure $ cleanAgentOut out
 
@@ -255,8 +260,8 @@ sessionPrompt = T.intercalate "\n" . map body
 
 -- | Build reply posts from a cleaned agent response.
 --
--- Addresses the last input's author on the last input's channel (conversation
--- reply).  Empty reply → no posts (quiet).
+-- Addresses the last input's sender and preserves any other names on the
+-- original wire (e.g. the bus channel).  Empty reply → no posts (quiet).
 replyPosts :: Text -> [Post] -> Text -> [Post]
 replyPosts who ins reply =
   case (listToMaybe (reverse ins), T.strip reply) of
@@ -264,9 +269,8 @@ replyPosts who ins reply =
     (Nothing, _) -> []
     (Just lastIn, r) ->
       [ Post
-          { author = who,
-            addr = author lastIn,
-            channel = channel lastIn,
+          { from = who,
+            to = from lastIn : filter (/= who) (to lastIn),
             body = r
           }
       ]
@@ -293,7 +297,7 @@ queryShard who query = do
 -- | Oneshot CLI agent (hermes by default) as a list 'Shard'.
 --
 -- Session file and process stay inside @IO@ — apply-only at this boundary.
--- @who@ is the agent nick (author on emitted posts).
+-- @who@ is the agent nick (from on emitted posts).
 oneshotShard :: AgentConfig -> Text -> IO (Shard IO [Post])
 oneshotShard cfg who = queryShard who (agentQuery cfg)
 

@@ -47,8 +47,8 @@ import System.IO (hPutStrLn, stderr)
 defaultRounds :: Int
 defaultRounds = 3
 
-mk :: Text -> Text -> Text -> Text -> Post
-mk a d c b = Post a d c b
+mk :: Text -> Text -> Text -> Post
+mk a d = Post a [d]
 
 assert :: String -> Bool -> IO ()
 assert msg ok =
@@ -158,20 +158,20 @@ runPure rounds = do
   -- nudge always asks for more; worker acks with a growing tag
   nudge <- pureShard "nudge" (const "tell me more.")
   worker <- pureShard "worker" (\t -> "ack:" <> t)
-  let seed = mk "human" "worker" "mr" "start"
+  let seed = mk "human" "worker" "start"
   trail <- pingPong rounds worker nudge seed
   putStrLn $ "  trail length: " <> show (length trail)
-  mapM_ (\p -> putStrLn $ "    " <> T.unpack (author p) <> " → " <> T.unpack (addr p) <> ": " <> T.unpack (T.take 60 (body p))) trail
+  mapM_ (\p -> putStrLn $ "    " <> T.unpack (from p) <> " → " <> T.unpack (T.pack (show (to p))) <> ": " <> T.unpack (T.take 60 (body p))) trail
   assert "pure: produced 2 posts per round" $ length trail == 2 * rounds
   assert "pure: alternates worker then nudge" $
-    let authors = map author trail
+    let authors = map from trail
      in authors == take (length authors) (cycle ["worker", "nudge"])
   assert "pure: first body is ack of seed" $
     case trail of
       (p : _) -> body p == "ack:start"
       _ -> False
   assert "pure: nudge bodies constant" $
-    all (\p -> author p /= "nudge" || body p == "tell me more.") trail
+    all (\p -> from p /= "nudge" || body p == "tell me more.") trail
 
 -- ---------------------------------------------------------------------------
 -- Tier 2: pure–hermes
@@ -192,7 +192,7 @@ runMixed rounds = do
         }
       "hermes"
   let seed =
-        mk "human" "hermes" "mr" $
+        mk "human" "hermes" $
           "You are in a "
             <> T.pack (show rounds)
             <> "-round drill. Reply with exactly: ready"
@@ -203,9 +203,9 @@ runMixed rounds = do
       exitWith (ExitFailure 2)
     Right trail -> do
       putStrLn $ "  trail length: " <> show (length trail)
-      mapM_ (\p -> putStrLn $ "    " <> T.unpack (author p) <> ": " <> T.unpack (T.take 80 (body p))) trail
+      mapM_ (\p -> putStrLn $ "    " <> T.unpack (from p) <> ": " <> T.unpack (T.take 80 (body p))) trail
       assert "mixed: produced posts" $ not (null trail)
-      assert "mixed: hermes authored some emit" $ any ((== "hermes") . author) trail
+      assert "mixed: hermes authored some emit" $ any ((== "hermes") . from) trail
       assert "mixed: no empty bodies" $ all (not . T.null . T.strip . body) trail
 
 -- ---------------------------------------------------------------------------
@@ -230,7 +230,7 @@ runDualHermes rounds = do
         }
       "bob"
   let seed =
-        mk "human" "alice" "mr" $
+        mk "human" "alice" $
           "You are alice. Bob will reply next. "
             <> "Answer in at most five words. First message only: say ping"
   er <- try @SomeException (pingPong rounds alice bob seed)
@@ -240,9 +240,9 @@ runDualHermes rounds = do
       exitWith (ExitFailure 2)
     Right trail -> do
       putStrLn $ "  trail length: " <> show (length trail)
-      mapM_ (\p -> putStrLn $ "    " <> T.unpack (author p) <> ": " <> T.unpack (T.take 80 (body p))) trail
+      mapM_ (\p -> putStrLn $ "    " <> T.unpack (from p) <> ": " <> T.unpack (T.take 80 (body p))) trail
       assert "dual: produced posts" $ not (null trail)
       assert "dual: both authors appear when rounds>=1" $
         rounds < 1
-          || (any ((== "alice") . author) trail && (rounds == 1 || any ((== "bob") . author) trail || length trail >= 1))
+          || (any ((== "alice") . from) trail && (rounds == 1 || any ((== "bob") . from) trail || length trail >= 1))
       assert "dual: no empty bodies" $ all (not . T.null . T.strip . body) trail

@@ -82,7 +82,7 @@ filterShard who = do
       (readIORef ref <* writeIORef ref [])
   where
     keep p
-      | author p == who = Nothing
+      | from p == who = Nothing
       | addressedTo who (body p) =
           Just p {body = stripAddress who (body p)}
       | otherwise = Nothing
@@ -114,10 +114,11 @@ metaShard acts diag = do
       JoinChannel c -> "meta: join #" <> T.pack c
       LeaveChannel c -> "meta: leave #" <> T.pack c
 
--- | Send emitted post bodies to a per-channel sink.
+-- | Send emitted post bodies to per-channel sinks.
 --
--- The map key is the channel name; the value is the send action. Posts are
--- passed through so downstream seats (bucket, diag) can still see them.
+-- The map key is a channel / wire name; the value is the send action. A post
+-- is sent to every sink whose name appears in its 'to' list. Posts are passed
+-- through so downstream seats (bucket, diag) can still see them.
 busSink :: Map Text (Text -> IO ()) -> IO (Shard IO [Post])
 busSink sinks = do
   ref <- newIORef []
@@ -128,9 +129,10 @@ busSink sinks = do
           outs <- readIORef ref
           writeIORef ref []
           forM_ outs $ \o ->
-            case Map.lookup (channel o) sinks of
-              Just send -> void $ try @SomeException (send (body o))
-              Nothing -> pure ()
+            forM_ (to o) $ \name ->
+              case Map.lookup name sinks of
+                Just send -> void $ try @SomeException (send (body o))
+                Nothing -> pure ()
           pure outs
       )
 
@@ -163,6 +165,6 @@ diagShard diag = do
           forM_ outs $ \o ->
             atomically $
               writeTQueue diag $
-                "emit on #" <> channel o <> ": " <> T.take 100 (body o)
+                "emit on " <> T.pack (show (to o)) <> ": " <> T.take 100 (body o)
           pure []
       )

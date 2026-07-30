@@ -34,8 +34,8 @@ assert msg ok =
     putStrLn $ "  FAIL " <> msg
     exitFailure
 
-mkPost :: Text -> Text -> Text -> Text -> Post
-mkPost a d c b = Post a d c b
+mkPost :: Text -> Text -> Text -> Post
+mkPost a d = Post a [d]
 
 pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post])
 pureShard who f = queryShard who (pure . f)
@@ -64,7 +64,7 @@ main = do
     void $ ensureChannel root panelChan
 
     -- Seed: the single problem every expert sees in round 1.
-    let seed = mkPost "human" "panel" "panel" "Q: what should we do?"
+    let seed = mkPost "human" "panel" "Q: what should we do?"
     post root panelChan human (body seed)
 
     -- Panel: n agents with distinct response functions.
@@ -85,11 +85,11 @@ main = do
         ([], [seed])
         (replicate nRounds ())
 
-    assert "each agent emitted once per round"
-      $ length allRoundPosts == nAgents * nRounds
+    assert "each agent emitted once per round" $
+      length allRoundPosts == nAgents * nRounds
 
     -- Post every round's replies to the public bus.
-    forM_ allRoundPosts $ \o -> post root panelChan (Nick (author o)) (body o)
+    forM_ allRoundPosts $ \o -> post root panelChan (Nick (from o)) (body o)
 
     -- Synthesizer sees all final-round replies.
     synthSeat <-
@@ -101,7 +101,7 @@ main = do
     assert "synth emits one synthesis" $ length sOuts == 1
 
     -- Post synthesis to the bus.
-    forM_ sOuts $ \o -> post root panelChan (Nick (author o)) (body o)
+    forM_ sOuts $ \o -> post root panelChan (Nick (from o)) (body o)
 
     -- Verify the public log contains the synthesis.
     final <- readTail root panelChan synth 10
