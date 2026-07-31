@@ -3,7 +3,7 @@ packages:
   ../circuits-agent/circuits-agent.cabal
   ../circuits/circuits.cabal
   ../circuits-ad/circuits-ad.cabal
-  ../circuits-poly/circuits-poly.cabal
+  ../string-diagrams/string-diagrams.cabal
   ../circuits-parser/circuits-parser.cabal
   ../harpie/harpie.cabal
   ../harpie-numhask/harpie-numhask.cabal
