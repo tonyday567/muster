@@ -229,7 +229,7 @@ discoveredChannels cfg = do
     then pure []
     else do
       entries <- listDirectory root
-      fmap (sort . concat) $ mapM (channelFor root) entries
+      sort . concat <$> mapM (channelFor root) entries
   where
     channelFor :: FilePath -> FilePath -> IO [String]
     channelFor root entry = do
@@ -307,7 +307,7 @@ runOneShot diagQ cfg = do
   let outPath = adir </> "output.md"
   wakeQueue <- newChan
   diag "scanning for joined channels..."
-  diag "  seat: oneshot Shard IO [Post] (circuits-agent)"
+  diag "  seat: oneshot Shard IO [Post] [Post] (circuits-agent)"
   let go :: Map String Channel -> Map String (Async ()) -> IO ()
       go channels watchers = do
         newChannels <- refreshChannels diag cfg channels
@@ -370,8 +370,8 @@ buildPipeline ::
   FilePath ->
   TChan MetaAction ->
   Map String Channel ->
-  Shard IO [Post] ->
-  IO (Shard IO [Post])
+  Shard IO [Post] [Post] ->
+  IO (Shard IO [Post] [Post])
 buildPipeline who diagQ outPath metaChan channels mainSeat = do
   f <- filterShard who
   m <- metaShard metaChan diagQ
@@ -385,7 +385,7 @@ handleWake ::
   TQueue Text ->
   Text ->
   FilePath ->
-  Shard IO [Post] ->
+  Shard IO [Post] [Post] ->
   TChan MetaAction ->
   Map String Channel ->
   (String, Text, Text) ->
@@ -489,7 +489,6 @@ stopAlert (h, ph) = do
   void $ try @SomeException $ hClose h
   void $ try @SomeException $ terminateProcess ph
   void $ try @SomeException $ waitForProcess ph
-  pure ()
 
 runPersistent :: MusterAgentConfig -> IO ()
 runPersistent cfg = do

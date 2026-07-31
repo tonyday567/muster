@@ -132,12 +132,12 @@ main = do
 
 -- | Assemble the pipeline for a given bus-sink map.
 buildPipeline ::
-  Shard IO [Post] ->
+  Shard IO [Post] [Post] ->
   Map Text (Text -> IO ()) ->
   FilePath ->
   TQueue Text ->
   TChan MetaAction ->
-  IO (Shard IO [Post])
+  IO (Shard IO [Post] [Post])
 buildPipeline mainSeat sinks outPath diagQ metaChan = do
   f <- filterShard "echo"
   m <- metaShard metaChan diagQ

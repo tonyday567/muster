@@ -70,7 +70,7 @@ main = do
     assert "replyPosts quiet on empty session" $
       null (replyPosts "echo" [] "x")
 
-  putStrLn "echo Shard IO [Post]"
+  putStrLn "echo Shard IO [Post] [Post]"
   do
     seat <- echoShard "echo"
     let pIn = mk "human" "echo" "ping"

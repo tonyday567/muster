@@ -1,6 +1,6 @@
 {-# LANGUAGE BlockArguments #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | Agent utilities: address matching and living 'Shard' adapters.
 --
@@ -34,6 +34,7 @@ import Circuit.Agent (Ends (..), Post (..), Shard, close, shard)
 import Control.Arrow (Kleisli (..), runKleisli)
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
+import Data.Foldable (for_)
 import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
@@ -168,9 +169,7 @@ runFresh sessionFile runAgent baseArgs = do
 
 updateSessionFile :: FilePath -> Text -> IO ()
 updateSessionFile path out =
-  case parseSessionId out of
-    Nothing -> pure ()
-    Just sid -> writeStoredSession path sid
+  for_ (parseSessionId out) (writeStoredSession path)
 
 agentSessionFile :: AgentConfig -> IO FilePath
 agentSessionFile cfg = do
@@ -248,7 +247,7 @@ cleanAgentOut =
        in T.all ok t
 
 -- ---------------------------------------------------------------------------
--- Living agent as Shard IO [Post] (seat, not rewrite)
+-- Living agent as Shard IO [Post] [Post] (seat, not rewrite)
 -- ---------------------------------------------------------------------------
 
 -- | Session assembly for the opaque seat: bodies, oldest-first, one per line.
@@ -280,7 +279,7 @@ replyPosts who ins reply =
 -- Commit assembles a session prompt from the input posts; emit is
 -- 'replyPosts' of the query result (empty = quiet).  Used by 'oneshotShard'
 -- (hermes) and 'echoShard' (mock).
-queryShard :: Text -> (Text -> IO Text) -> IO (Shard IO [Post])
+queryShard :: Text -> (Text -> IO Text) -> IO (Shard IO [Post] [Post])
 queryShard who query = do
   outbox <- newIORef []
   pure $
@@ -292,22 +291,21 @@ queryShard who query = do
               reply <- query (sessionPrompt ins)
               writeIORef outbox (replyPosts who ins reply)
       )
-      (atomicModifyIORef' outbox (\os -> ([], os)))
+      (atomicModifyIORef' outbox ([],))
 
 -- | Oneshot CLI agent (hermes by default) as a list 'Shard'.
 --
 -- Session file and process stay inside @IO@ — apply-only at this boundary.
 -- @who@ is the agent nick (from on emitted posts).
-oneshotShard :: AgentConfig -> Text -> IO (Shard IO [Post])
+oneshotShard :: AgentConfig -> Text -> IO (Shard IO [Post] [Post])
 oneshotShard cfg who = queryShard who (agentQuery cfg)
 
 -- | Mock seat: reply body is the session prompt (echo).
 --
 -- Demonstrates the living-agent path without hermes.
-echoShard :: Text -> IO (Shard IO [Post])
+echoShard :: Text -> IO (Shard IO [Post] [Post])
 echoShard who = queryShard who pure
 
 -- | One closed shard turn: commit @ins@, emit replies.
-runShard :: Shard IO [Post] -> [Post] -> IO [Post]
-runShard sh ins =
-  runKleisli (close (conjoint sh) (companion sh)) ins
+runShard :: Shard IO [Post] [Post] -> [Post] -> IO [Post]
+runShard sh = runKleisli (close (conjoint sh) (companion sh))

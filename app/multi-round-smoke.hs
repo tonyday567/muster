@@ -10,7 +10,7 @@
 --
 -- Naming: these are not \"Identity agents\". A pure seat is
 -- @queryShard who (pure . f)@ — Moore-shaped evaluate with a pure @Text -> Text@.
--- @Shard Identity [Post]@ is a different (pure Ends) packaging in circuits-agent verify.
+-- @Shard Identity [Post] [Post]@ is a different (pure Ends) packaging in circuits-agent verify.
 --
 -- @
 --   cabal run muster-multi-round-smoke
@@ -27,6 +27,7 @@ module Main (main) where
 
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Muster.Agent
@@ -62,7 +63,7 @@ assert msg ok =
 --
 -- Each step is one closed 'runShard' turn (commit list, emit list). The
 -- conversation is the posts themselves — multi-round, not oneshot-shaped.
-pingPong :: Int -> Shard IO [Post] -> Shard IO [Post] -> Post -> IO [Post]
+pingPong :: Int -> Shard IO [Post] [Post] -> Shard IO [Post] [Post] -> Post -> IO [Post]
 pingPong n seatA seatB seed = go n seed []
   where
     go 0 _ acc = pure (reverse acc)
@@ -77,7 +78,7 @@ pingPong n seatA seatB seed = go n seed []
             (b : _) -> go (k - 1) b (b : a : acc)
 
 -- | Pure seat: @Text -> Text@ with no external process.
-pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post])
+pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post] [Post])
 pureShard who f = queryShard who (pure . f)
 
 data Tier = Pure | Mixed | DualHermes | All
@@ -123,7 +124,7 @@ main = do
     exitWith (ExitFailure 1)
 
   mHermes <- findExecutable "hermes"
-  when (needHermes tier && mHermes == Nothing) $ do
+  when (needHermes tier && isNothing mHermes) $ do
     hPutStrLn stderr "muster-multi-round-smoke: hermes not on PATH — skip (exit 2)"
     exitWith (ExitFailure 2)
 
@@ -157,7 +158,7 @@ runPure rounds = do
   putStrLn "tier pure–pure (two pure seats)"
   -- nudge always asks for more; worker acks with a growing tag
   nudge <- pureShard "nudge" (const "tell me more.")
-  worker <- pureShard "worker" (\t -> "ack:" <> t)
+  worker <- pureShard "worker" ("ack:" <>)
   let seed = mk "human" "worker" "start"
   trail <- pingPong rounds worker nudge seed
   putStrLn $ "  trail length: " <> show (length trail)
@@ -182,8 +183,8 @@ runMixed rounds = do
   putStrLn "tier pure–hermes"
   -- pure coach; hermes answers briefly
   nudge <-
-    pureShard "nudge" $ \_ ->
-      "Reply with exactly one short sentence. Do not ask questions."
+    pureShard "nudge" $
+      const "Reply with exactly one short sentence. Do not ask questions."
   hermes <-
     oneshotShard
       defaultAgentConfig
@@ -206,7 +207,7 @@ runMixed rounds = do
       mapM_ (\p -> putStrLn $ "    " <> T.unpack (from p) <> ": " <> T.unpack (T.take 80 (body p))) trail
       assert "mixed: produced posts" $ not (null trail)
       assert "mixed: hermes authored some emit" $ any ((== "hermes") . from) trail
-      assert "mixed: no empty bodies" $ all (not . T.null . T.strip . body) trail
+      assert "mixed: no empty bodies" $ not (any (T.null . T.strip . body) trail)
 
 -- ---------------------------------------------------------------------------
 -- Tier 3: hermes–hermes
@@ -244,5 +245,5 @@ runDualHermes rounds = do
       assert "dual: produced posts" $ not (null trail)
       assert "dual: both authors appear when rounds>=1" $
         rounds < 1
-          || (any ((== "alice") . from) trail && (rounds == 1 || any ((== "bob") . from) trail || length trail >= 1))
-      assert "dual: no empty bodies" $ all (not . T.null . T.strip . body) trail
+          || (any ((== "alice") . from) trail && (rounds == 1 || any ((== "bob") . from) trail || not (null trail)))
+      assert "dual: no empty bodies" $ not (any (T.null . T.strip . body) trail)

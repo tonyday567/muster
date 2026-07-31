@@ -37,7 +37,7 @@ assert msg ok =
 mkPost :: Text -> Text -> Text -> Post
 mkPost a d = Post a [d]
 
-pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post])
+pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post] [Post])
 pureShard who f = queryShard who (pure . f)
 
 main :: IO ()
@@ -59,9 +59,9 @@ main = do
     threadDelay 100_000
 
     -- Three independent experts, each fed only the seed.
-    alphaSeat <- pureShard "alpha" (\_ -> "alpha notes: factor A")
-    betaSeat <- pureShard "beta" (\_ -> "beta notes: factor B")
-    gammaSeat <- pureShard "gamma" (\_ -> "gamma notes: factor C")
+    alphaSeat <- pureShard "alpha" (const "alpha notes: factor A")
+    betaSeat <- pureShard "beta" (const "beta notes: factor B")
+    gammaSeat <- pureShard "gamma" (const "gamma notes: factor C")
 
     aOuts <- runShard alphaSeat [seed]
     bOuts <- runShard betaSeat [seed]

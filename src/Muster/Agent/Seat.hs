@@ -32,7 +32,7 @@ import Data.Either (partitionEithers)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -58,9 +58,7 @@ data MetaAction
 parseMetaAction :: Text -> Maybe MetaAction
 parseMetaAction t =
   let low = T.toLower $ T.strip t
-      stripHash c = case T.stripPrefix "#" c of
-        Just r -> r
-        Nothing -> c
+      stripHash c = fromMaybe c (T.stripPrefix "#" c)
    in case T.words low of
         ["join", c] -> Just (JoinChannel (T.unpack (stripHash c)))
         ["leave", c] -> Just (LeaveChannel (T.unpack (stripHash c)))
@@ -73,12 +71,12 @@ parseMetaAction t =
 -- | Keep only posts addressed to @who@, stripping the addressing prefix.
 --
 -- Self-posts and non-addressed posts become quiet (empty emit).
-filterShard :: Text -> IO (Shard IO [Post])
+filterShard :: Text -> IO (Shard IO [Post] [Post])
 filterShard who = do
   ref <- newIORef []
   pure $
     shard
-      (\ins -> writeIORef ref (mapMaybe keep ins))
+      (writeIORef ref . mapMaybe keep)
       (readIORef ref <* writeIORef ref [])
   where
     keep p
@@ -91,12 +89,12 @@ filterShard who = do
 --
 -- Meta actions are written to the supplied 'TChan' and logged to the diag
 -- queue; they do not propagate downstream.
-metaShard :: TChan MetaAction -> TQueue Text -> IO (Shard IO [Post])
+metaShard :: TChan MetaAction -> TQueue Text -> IO (Shard IO [Post] [Post])
 metaShard acts diag = do
   ref <- newIORef []
   pure $
     shard
-      (\ins -> writeIORef ref ins)
+      (writeIORef ref)
       ( do
           ins <- readIORef ref
           writeIORef ref []
@@ -119,12 +117,12 @@ metaShard acts diag = do
 -- The map key is a channel / wire name; the value is the send action. A post
 -- is sent to every sink whose name appears in its 'to' list. Posts are passed
 -- through so downstream seats (bucket, diag) can still see them.
-busSink :: Map Text (Text -> IO ()) -> IO (Shard IO [Post])
+busSink :: Map Text (Text -> IO ()) -> IO (Shard IO [Post] [Post])
 busSink sinks = do
   ref <- newIORef []
   pure $
     shard
-      (\outs -> writeIORef ref outs)
+      (writeIORef ref)
       ( do
           outs <- readIORef ref
           writeIORef ref []
@@ -139,12 +137,12 @@ busSink sinks = do
 -- | Append emitted post bodies to a file.
 --
 -- Passes posts through so a downstream 'diagShard' can log them.
-bucketShard :: FilePath -> IO (Shard IO [Post])
+bucketShard :: FilePath -> IO (Shard IO [Post] [Post])
 bucketShard outPath = do
   ref <- newIORef []
   pure $
     shard
-      (\outs -> writeIORef ref outs)
+      (writeIORef ref)
       ( do
           outs <- readIORef ref
           writeIORef ref []
@@ -153,12 +151,12 @@ bucketShard outPath = do
       )
 
 -- | Terminal seat: log every emitted post to the diag queue.
-diagShard :: TQueue Text -> IO (Shard IO [Post])
+diagShard :: TQueue Text -> IO (Shard IO [Post] [Post])
 diagShard diag = do
   ref <- newIORef []
   pure $
     shard
-      (\outs -> writeIORef ref outs)
+      (writeIORef ref)
       ( do
           outs <- readIORef ref
           writeIORef ref []
