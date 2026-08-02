@@ -85,6 +85,7 @@
       min-height: 0;
     }
     #log .line { margin: 0.1rem 0; }
+    #log .line.err { color: #e06c75; }
     .msg {
       display: flex;
       align-items: baseline;
@@ -186,6 +187,9 @@
 
     /** @type {Map<string, WebSocket>} */
     const sockets = new Map();
+    // Highest line number displayed per channel: dedups history/live overlap
+    // and history replays after an auto-reconnect. Reset by connectAll.
+    const maxN = new Map();
     let backoff = 2000;
     let reconnectTimer = null;
 
@@ -266,19 +270,54 @@
 
     function append(chan, line) {
       const stick = nearBottom(logEl);
-      const m = line.match(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\]\s+([^:]+):\s*(.*)$/);
-      if (!m) {
+      // Parse-once protocol: {type:"post",history,n,raw,sender,body} or
+      // {type:"error",message}. Fall back to the raw bus line on anything else.
+      let sender = null;
+      let body = null;
+      let raw = line;
+      let errMsg = null;
+      try {
+        const o = JSON.parse(line);
+        if (o && o.type === 'post') {
+          if (typeof o.n === 'number') {
+            const seen = maxN.get(chan) || 0;
+            if (o.n <= seen) return; // already on screen (overlap or replay)
+            maxN.set(chan, o.n);
+          }
+          sender = o.sender != null ? o.sender : null;
+          body = o.body != null ? o.body : null;
+          raw = o.raw || line;
+        } else if (o && o.type === 'error') {
+          errMsg = o.message || 'unknown error';
+        }
+      } catch (_) { /* not JSON: treat as a raw bus line */ }
+      if (errMsg !== null) {
         const d = document.createElement('div');
-        d.className = 'line';
-        d.textContent = (state.channels.length > 1 ? '#' + chan + ' ' : '') + line;
+        d.className = 'line err';
+        d.textContent = (state.channels.length > 1 ? '#' + chan + ' ' : '') + '! ' + errMsg;
         logEl.appendChild(d);
         lastKey = null;
         lastBody = null;
         if (stick) logEl.scrollTop = logEl.scrollHeight;
         return;
       }
-      const sender = m[1];
-      const body = m[2];
+      if (sender === null || body === null) {
+        const m = raw.match(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\]\s+([^:]+):\s*(.*)$/);
+        if (m) {
+          sender = m[1];
+          body = m[2];
+        }
+      }
+      if (sender === null || body === null) {
+        const d = document.createElement('div');
+        d.className = 'line';
+        d.textContent = (state.channels.length > 1 ? '#' + chan + ' ' : '') + raw;
+        logEl.appendChild(d);
+        lastKey = null;
+        lastBody = null;
+        if (stick) logEl.scrollTop = logEl.scrollHeight;
+        return;
+      }
       const key = chan + '\0' + sender;
       const multi = state.channels.length > 1;
       if (key === lastKey && lastBody) {
@@ -374,6 +413,7 @@
     function connectAll() {
       clearLog();
       closeAll();
+      maxN.clear();
       backoff = 2000;
       if (state.channels.length === 0) {
         logEl.textContent = 'select at least one channel and press watch';

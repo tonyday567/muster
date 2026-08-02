@@ -1,6 +1,7 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Central bus daemon for the rebuilt muster API.
 --
@@ -44,8 +45,9 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, pollSTM)
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
-import Control.Exception (IOException, SomeException, bracket, finally, try)
+import Control.Exception (IOException, SomeException, bracket, catch, finally, try)
 import Control.Monad (forever, forM, unless, void, when)
+import Data.ByteString qualified as BS
 import Data.Char (isSpace)
 import Data.Map.Strict (Map)
 import Data.Maybe (catMaybes)
@@ -55,6 +57,8 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Data.Text.Encoding (encodeUtf8)
+import Data.Time.Clock (getCurrentTime)
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
 import Muster.Bus qualified as Bus
 import Muster.Cursor qualified as Cur
@@ -72,14 +76,15 @@ import System.IO
   ( BufferMode (..),
     IOMode (..),
     hClose,
-    hFlush,
-    hIsEOF,
     hSetBuffering,
     hSetEncoding,
     openFile,
     utf8,
   )
+import System.IO.Error (isEOFError)
 import System.Posix.Files (createNamedPipe, stdFileMode)
+import System.Posix.IO (OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags, openFd)
+import System.Posix.IO.ByteString (fdWrite)
 import System.Posix.Process (getProcessID)
 import System.Posix.Signals (sigTERM, signalProcess)
 import System.Posix.Types (CPid (..), ProcessID)
@@ -312,30 +317,44 @@ waitForChannel root chan = go (20 :: Int)
 channelRelay :: BusRoot -> Channel -> IO ()
 channelRelay root chan = do
   self <- getProcessID
-  dir <- ensureChannel root chan
-  let p = Bus.pathsFor dir
+  _dir <- ensureChannel root chan
   writeFile (Bus.busPid p) (show (pidToInt self) <> "\n")
-  bracket (openFifo p) hClose (relay p)
+  -- Log appends go through a raw POSIX fd, held open for the relay's life.
+  -- GHC 'openFile' takes an advisory lock (exclusive for AppendMode) in the
+  -- RTS lock table: in-process readers (post's growth check, the ws pump)
+  -- then intermittently collide with a per-line open, and the collision
+  -- used to cost the line already consumed from the FIFO.  A raw fd takes
+  -- no GHC lock at all, so readers never see us and no line is lost.
+  bracket openLog closeFd $ \logFd ->
+    forever (relayOnce logFd)
   where
-    openFifo p = do
-      h <- openFile (Bus.busFifo p) ReadWriteMode
+    p = Bus.pathsFor (channelPath root chan)
+    openLog =
+      openFd
+        (Bus.busLog p)
+        WriteOnly
+        defaultFileFlags {append = True, creat = Just stdFileMode}
+    relayOnce logFd =
+      bracket (openFifo p) hClose (\h -> forever (TIO.hGetLine h >>= appendLine logFd))
+        `catch` \(e :: IOException) -> dbg e
+    dbg :: IOException -> IO ()
+    dbg e = do
+      ts <- take 19 . show <$> getCurrentTime
+      let tag = if isEOFError e then "eof-reopen" else "relay-exception"
+      appendFile (Bus.busErr p) (ts <> " " <> tag <> " " <> show e <> "\n")
+        `catch` \(_ :: IOException) -> pure ()
+    openFifo p' = do
+      h <- openFile (Bus.busFifo p') ReadWriteMode
       hSetEncoding h utf8
       hSetBuffering h LineBuffering
       pure h
-    relay p h = forever $ do
-      eof <- hIsEOF h
-      if eof
-        then threadDelay 100000
-        else do
-          line <- TIO.hGetLine h
-          appendLine p line
-    appendLine p line = do
-      logH <- openFile (Bus.busLog p) AppendMode
-      hSetEncoding logH utf8
-      hSetBuffering logH NoBuffering
-      TIO.hPutStrLn logH line
-      hFlush logH
-      hClose logH
+    appendLine logFd line = go (encodeUtf8 (line <> "\n"))
+      where
+        go bs
+          | BS.null bs = pure ()
+          | otherwise = do
+              n <- fdWrite logFd bs
+              go (BS.drop (fromIntegral n) bs)
 
 -- | One scan pass: make sure every existing channel has a live relay thread,
 -- and drop relays for channels that have disappeared.

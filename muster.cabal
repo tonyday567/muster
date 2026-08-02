@@ -74,21 +74,27 @@ library
         Muster.Agent
         Muster.Agent.Seat
         Muster.Connector
+        Muster.Ws
 
     build-depends:
         base,
         async,
+        bytestring,
         circuits >=0.1.0.0 && <0.4,
         circuits-agent,
         containers,
         directory,
         filepath,
+        http-types,
         optparse-applicative,
         process,
         stm,
         text,
         time,
-        unix
+        unix,
+        wai,
+        wai-websockets,
+        websockets
 
     hs-source-dirs:   src
 
@@ -254,22 +260,38 @@ executable muster-ws
 
     build-depends:
         base,
-        async,
         bytestring,
-        circuits-agent,
-        containers,
         file-embed,
-        http-types,
         muster,
         optparse-applicative,
-        process,
-        stm,
         text,
         directory,
         filepath,
-        unix,
-        wai,
-        wai-websockets,
+        warp
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
+-- Structural oracle for the muster-ws refactor (launch L1): two clients,
+-- exactly-once delivery, no history/live gap, visible post failure.
+executable muster-ws-smoke
+    import:           warnings
+
+    main-is:          ws-smoke.hs
+
+    ghc-options: -threaded
+
+    build-depends:
+        base,
+        aeson,
+        async,
+        bytestring,
+        directory,
+        filepath,
+        muster,
+        stm,
+        text,
         warp,
         websockets
 

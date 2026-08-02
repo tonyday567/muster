@@ -28,7 +28,7 @@ module Muster.Bus
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (IOException, bracket, finally, try)
+import Control.Exception (IOException, bracket, catch, finally, try)
 import Control.Monad (forever, unless, void, when)
 import Data.Char (isSpace)
 import Data.List (isPrefixOf)
@@ -52,7 +52,6 @@ import System.IO
     IOMode (..),
     hClose,
     hFlush,
-    hIsEOF,
     hPutStrLn,
     hSetBuffering,
     hSetEncoding,
@@ -61,6 +60,7 @@ import System.IO
     stdout,
     utf8,
   )
+import System.IO.Error (isEOFError)
 import System.Posix.Files (createNamedPipe, stdFileMode)
 import System.Posix.Process (getProcessID)
 import System.Posix.Types (CPid (..), ProcessID)
@@ -198,25 +198,28 @@ busDaemon :: FilePath -> IO ()
 busDaemon dir = do
   let p = pathsFor dir
   createDirectoryIfMissing True dir
-  h <- openFile (busFifo p) ReadWriteMode
-  hSetEncoding h utf8
-  hSetBuffering h LineBuffering
-  logH <- openFile (busLog p) AppendMode
-  hSetEncoding logH utf8
-  hSetBuffering logH NoBuffering
   self <- getProcessID
   writeFile (busPid p) (show (pidToInt self) <> "\n")
-  relay h logH `finally` (hClose h >> hClose logH)
-  where
-    relay :: Handle -> Handle -> IO ()
-    relay h logH = forever do
-      eof <- hIsEOF h
-      if eof
-        then threadDelay 100000
-        else do
-          line <- TIO.hGetLine h
-          TIO.hPutStrLn logH line
-          hFlush logH
+  -- Block on reads.  When every external writer closes, 'hGetLine'
+  -- raises EOF — and GHC latches EOF on the handle, so the handle can
+  -- never see later writes.  Close and re-open fresh; lines written
+  -- meanwhile wait in the kernel pipe.  No hIsEOF polling: the poll
+  -- was what latched.
+  let relayOnce = do
+        h <- openFile (busFifo p) ReadWriteMode
+        hSetEncoding h utf8
+        hSetBuffering h LineBuffering
+        logH <- openFile (busLog p) AppendMode
+        hSetEncoding logH utf8
+        hSetBuffering logH NoBuffering
+        (relay h logH `finally` (hClose h >> hClose logH))
+          `catch` \e -> if isEOFError e then pure () else ioError e
+      relay :: Handle -> Handle -> IO ()
+      relay h logH = forever do
+        line <- TIO.hGetLine h
+        TIO.hPutStrLn logH line
+        hFlush logH
+  forever relayOnce
 
 -- | Start the bus daemon by re-execing the current binary as @bus daemon@.
 busStart :: FilePath -> String -> FilePath -> IO ()
@@ -313,7 +316,9 @@ busLiveness dir = do
 -- Post / read / wait / log
 -- ---------------------------------------------------------------------------
 
--- | Post a framed message to the channel. Fails if the bus is down.
+-- | Post a framed message to the channel. Fails (as an 'IOException') if
+-- the bus is down or the log does not grow — callers may catch; the CLI
+-- dies with the same message and exit 1 as before.
 post :: FilePath -> String -> Text -> IO ()
 post dir sender body = do
   let p = pathsFor dir
@@ -321,7 +326,7 @@ post dir sender body = do
   case running of
     Nothing -> do
       hPutStrLn stderr "post FAILED: bus is down (run: muster bus start)"
-      exitWith (ExitFailure 1)
+      ioError (userError "post FAILED: bus is down")
     Just _ -> do
       before <- countLogLines dir
       ts <- formatNow
@@ -335,13 +340,14 @@ post dir sender body = do
       ok <- checkGrew (busLog p) before 20
       unless ok do
         after <- countLogLines dir
-        hPutStrLn stderr $
-          "post WARNING: log did not grow ("
-            <> show before
-            <> "->"
-            <> show after
-            <> ") — bus may be wedged"
-        exitWith (ExitFailure 1)
+        let msg =
+              "post WARNING: log did not grow ("
+                <> show before
+                <> "->"
+                <> show after
+                <> ") — bus may be wedged"
+        hPutStrLn stderr msg
+        ioError (userError msg)
 
 checkGrew :: FilePath -> Int -> Int -> IO Bool
 checkGrew logPath before n = do
