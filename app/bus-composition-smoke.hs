@@ -35,7 +35,7 @@ assert msg ok =
     exitFailure
 
 mkPost :: Text -> Text -> Text -> Post Text
-mkPost a d = Post a [d] Nothing
+mkPost a d = Post a [d] []
 
 pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post Text] [Post Text])
 pureShard who f = queryShard who (pure . f)

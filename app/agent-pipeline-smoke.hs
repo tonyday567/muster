@@ -47,7 +47,7 @@ assert msg ok =
     exitFailure
 
 mkPost :: Text -> [Text] -> Text -> Post Text
-mkPost a ds = Post a ds Nothing
+mkPost a ds = Post a ds []
 
 main :: IO ()
 main = do

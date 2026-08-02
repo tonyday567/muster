@@ -35,7 +35,7 @@ assert msg ok =
       exitFailure
 
 mk :: Text -> Text -> Text -> Post Text
-mk a d = Post a [d] Nothing
+mk a d = Post a [d] []
 
 -- | Same decode as circuits-agent-observe: channel is the address.
 decodePost :: Channel -> Text -> Maybe (Post Text)
@@ -45,7 +45,7 @@ decodePost chan line = do
     Post
       { from = author',
         to = [unChannel chan],
-        thread = Nothing,
+        thread = [],
         body = body'
       }
 

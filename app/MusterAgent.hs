@@ -398,7 +398,7 @@ handleWake diagQ who outPath mainSeat metaChan channels (channel, sender, rawBod
         Post
           { from = sender,
             to = [who, T.pack channel],
-            thread = Nothing,
+            thread = [],
             body = rawBody
           }
   void $ try @SomeException (runShard pipeline [pIn])

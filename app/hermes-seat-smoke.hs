@@ -30,7 +30,7 @@ import System.Exit (ExitCode (..), exitWith)
 import System.IO (hPutStrLn, stderr)
 
 mk :: Text -> Text -> Text -> Post Text
-mk a d = Post a [d] Nothing
+mk a d = Post a [d] []
 
 main :: IO ()
 main = do

@@ -49,7 +49,7 @@ defaultRounds :: Int
 defaultRounds = 3
 
 mk :: Text -> Text -> Text -> Post Text
-mk a d = Post a [d] Nothing
+mk a d = Post a [d] []
 
 assert :: String -> Bool -> IO ()
 assert msg ok =
