@@ -1,22 +1,22 @@
-{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TupleSections #-}
 
 -- | Agent utilities: address matching and living 'Shard' adapters.
 --
--- Evaluate is a circuits-agent 'Shard': commit @[Post]@, emit @[Post]@.
--- @oneshotShard@ is one adapter (CLI per eval + session file opacity).
--- Multi-round dialogue is repeated 'runShard', not a different seat type.
--- This is not a rewrite of the bus — only the evaluate step is seated.
+-- The evaluate seat has moved down to circuits-agent ('Circuit.Agent.Cli'):
+-- invocation recipes are data ('Cli'), sessions are scraped and resumed with
+-- stale fallback, and prompts travel via argv — no shell quoting, so
+-- multi-line bodies survive.  This module keeps muster's addressing helpers
+-- and the hermes-flavoured 'AgentConfig', and re-exports the shard adapters.
 module Muster.Agent
   ( AgentMode (..),
     AgentConfig (..),
     defaultAgentConfig,
     addressedTo,
     stripAddress,
+    agentCli,
     agentQuery,
 
-    -- * Living agent as Shard
+    -- * Living agent as Shard (from 'Circuit.Agent.Cli')
     queryShard,
     oneshotShard,
     echoShard,
@@ -30,22 +30,24 @@ module Muster.Agent
   )
 where
 
-import Circuit.Agent (Ends (..), Post (..), Shard, close, shard)
-import Control.Arrow (Kleisli (..), runKleisli)
-import Control.Exception (SomeException, try)
-import Control.Monad (when)
-import Data.Foldable (for_)
-import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
-import Data.Maybe (fromMaybe, listToMaybe)
+import Circuit.Agent (Post (..), Shard)
+import Circuit.Agent.Cli
+  ( Cli,
+    cliQuery,
+    cliShard,
+    echoShard,
+    hermesCli,
+    queryShard,
+    replyPosts,
+    runShardIO,
+    sessionPrompt,
+  )
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.IO qualified as TIO
 import Muster.Config qualified as Config
-import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (lookupEnv)
-import System.Exit (ExitCode (..))
-import System.FilePath (takeDirectory, (</>))
-import System.Process (readCreateProcessWithExitCode, shell)
+import System.FilePath ((</>))
 import Prelude
 
 -- | Agent runtime mode.
@@ -115,197 +117,39 @@ stripAddress name body =
           Just rest -> rest
           Nothing -> T.strip body
 
--- | Run the configured oneshot agent command against a prompt.
+-- | Build the hermes 'Cli' recipe for an agent config.
 --
--- Invoked as @\<agent\> chat -q \<prompt\>@.  The first call creates a Hermes
--- session; subsequent calls resume it by session id so context persists across
--- dispatches.  If the stored session disappears, we fall back to a fresh
--- session and record the new id.
-agentQuery :: AgentConfig -> Text -> IO Text
-agentQuery cfg prompt = do
+-- Model/provider resolution: config field, else @HERMES_MODEL@ /
+-- @HERMES_PROVIDER@ environment, else deepseek defaults.  The session file
+-- lives in the agent's config dir.
+agentCli :: AgentConfig -> IO Cli
+agentCli cfg = do
   homeModel <- lookupEnv "HERMES_MODEL"
   homeProv <- lookupEnv "HERMES_PROVIDER"
-  sessionFile <- agentSessionFile cfg
   let model = fromMaybe (fromMaybe "deepseek-v4-pro" homeModel) (cfgModel cfg)
       provider = fromMaybe (fromMaybe "deepseek" homeProv) (cfgProvider cfg)
-      q = shellQuote (T.unpack prompt)
-      baseArgs =
-        [ cfgAgent cfg <> " chat -q",
-          q,
-          "-m",
-          shellQuote model,
-          "--provider",
-          shellQuote provider,
-          "--yolo -Q --max-turns 90"
-        ]
-      resumeArgs sid = baseArgs <> ["--resume", shellQuote sid]
-      runAgent args = do
-        let cmd = unwords ("export PATH=\"$HOME/.local/bin:$PATH\";" : args)
-        (code, out, err) <- readCreateProcessWithExitCode (shell cmd) ""
-        pure (code, T.pack out <> T.pack err)
-  mSid <- readStoredSession sessionFile
-  case mSid of
-    Nothing -> runFresh sessionFile runAgent baseArgs
-    Just sid -> do
-      (code, out) <- runAgent (resumeArgs sid)
-      let stale =
-            code /= ExitSuccess
-              || "No session found matching" `T.isInfixOf` out
-              || "Session not found" `T.isInfixOf` out
-      if stale
-        then runFresh sessionFile runAgent baseArgs
-        else do
-          updateSessionFile sessionFile out
-          pure $ cleanAgentOut out
-
-runFresh :: FilePath -> ([String] -> IO (ExitCode, Text)) -> [String] -> IO Text
-runFresh sessionFile runAgent baseArgs = do
-  (code, out) <- runAgent baseArgs
-  when (code /= ExitSuccess) $
-    fail $
-      "agent failed (code " <> show code <> "): " <> T.unpack (T.take 200 out)
-  updateSessionFile sessionFile out
-  pure $ cleanAgentOut out
-
-updateSessionFile :: FilePath -> Text -> IO ()
-updateSessionFile path out =
-  for_ (parseSessionId out) (writeStoredSession path)
-
-agentSessionFile :: AgentConfig -> IO FilePath
-agentSessionFile cfg = do
   dir <- Config.agentSessionDir (cfgName cfg)
-  pure (dir </> "session")
+  pure (hermesCli (Just (T.pack model)) (Just (T.pack provider)) (dir </> "session"))
 
-readStoredSession :: FilePath -> IO (Maybe String)
-readStoredSession path = do
-  exists <- doesFileExist path
-  if not exists
-    then pure Nothing
-    else do
-      res <- try @SomeException (TIO.readFile path)
-      pure case res of
-        Left _ -> Nothing
-        Right t ->
-          let sid = T.unpack (T.strip t)
-           in if null sid then Nothing else Just sid
-
-writeStoredSession :: FilePath -> String -> IO ()
-writeStoredSession path sid = do
-  createDirectoryIfMissing True (takeDirectory path)
-  TIO.writeFile path (T.pack sid)
-
-parseSessionId :: Text -> Maybe String
-parseSessionId out =
-  case filter ("session_id:" `T.isPrefixOf`) (T.lines out) of
-    (line : _) ->
-      let sid = T.strip (T.drop (T.length "session_id:") line)
-       in if T.null sid then Nothing else Just (T.unpack sid)
-    _ -> Nothing
-
-shellQuote :: String -> String
-shellQuote s = "'" <> concatMap esc s <> "'"
-  where
-    esc '\'' = "'\\''"
-    esc c = [c]
-
-cleanAgentOut :: Text -> Text
-cleanAgentOut =
-  T.unlines
-    . filter keep
-    . map T.strip
-    . T.lines
-  where
-    keep l
-      | T.null l = False
-      | "session_id:" `T.isPrefixOf` l = False
-      | "Warning:" `T.isPrefixOf` l = False
-      | "Resumed session" `T.isInfixOf` l = False
-      | "Reached maximum" `T.isInfixOf` l = False
-      | "Requesting summary" `T.isInfixOf` l = False
-      | "No session found matching" `T.isInfixOf` l = False
-      | "Use 'hermes sessions list'" `T.isInfixOf` l = False
-      | "Resume this session with:" `T.isInfixOf` l = False
-      | "Shutting down" `T.isInfixOf` l = False
-      | "Session:" `T.isPrefixOf` l = False
-      | "Duration:" `T.isPrefixOf` l = False
-      | "Messages:" `T.isPrefixOf` l = False
-      | "⚕" `T.isPrefixOf` l = False
-      | "❯" `T.isPrefixOf` l = False
-      | T.any (== '\x1b') l = False
-      | isDecorative l = False
-      | otherwise = True
-    isDecorative t =
-      let ok c =
-            c == ' '
-              || c == '\r'
-              || c == '─'
-              || c == '│'
-              || c == '┌'
-              || c == '┐'
-              || c == '└'
-              || c == '┘'
-       in T.all ok t
-
--- ---------------------------------------------------------------------------
--- Living agent as Shard IO [Post] [Post] (seat, not rewrite)
--- ---------------------------------------------------------------------------
-
--- | Session assembly for the opaque seat: bodies, oldest-first, one per line.
+-- | Run the configured oneshot agent against a prompt.
 --
--- This is the discoverable side of the boundary (data).  How hermes folds it
--- is not.
-sessionPrompt :: [Post] -> Text
-sessionPrompt = T.intercalate "\n" . map body
-
--- | Build reply posts from a cleaned agent response.
---
--- Addresses the last input's sender and preserves any other names on the
--- original wire (e.g. the bus channel).  Empty reply → no posts (quiet).
-replyPosts :: Text -> [Post] -> Text -> [Post]
-replyPosts who ins reply =
-  case (listToMaybe (reverse ins), T.strip reply) of
-    (_, r) | T.null r -> []
-    (Nothing, _) -> []
-    (Just lastIn, r) ->
-      [ Post
-          { from = who,
-            to = from lastIn : filter (/= who) (to lastIn),
-            body = r
-          }
-      ]
-
--- | Opaque evaluate seat: any @Text -> IO Text@ behind list ends.
---
--- Commit assembles a session prompt from the input posts; emit is
--- 'replyPosts' of the query result (empty = quiet).  Used by 'oneshotShard'
--- (hermes) and 'echoShard' (mock).
-queryShard :: Text -> (Text -> IO Text) -> IO (Shard IO [Post] [Post])
-queryShard who query = do
-  outbox <- newIORef []
-  pure $
-    shard
-      ( \ins ->
-          if null ins
-            then writeIORef outbox []
-            else do
-              reply <- query (sessionPrompt ins)
-              writeIORef outbox (replyPosts who ins reply)
-      )
-      (atomicModifyIORef' outbox ([],))
+-- First call creates a session; subsequent calls resume it by session id so
+-- context persists across dispatches.  If the stored session disappears, we
+-- fall back to a fresh session and record the new id.
+agentQuery :: AgentConfig -> Text -> IO Text
+agentQuery cfg prompt = do
+  cli <- agentCli cfg
+  cliQuery cli prompt
 
 -- | Oneshot CLI agent (hermes by default) as a list 'Shard'.
 --
 -- Session file and process stay inside @IO@ — apply-only at this boundary.
 -- @who@ is the agent nick (from on emitted posts).
 oneshotShard :: AgentConfig -> Text -> IO (Shard IO [Post] [Post])
-oneshotShard cfg who = queryShard who (agentQuery cfg)
-
--- | Mock seat: reply body is the session prompt (echo).
---
--- Demonstrates the living-agent path without hermes.
-echoShard :: Text -> IO (Shard IO [Post] [Post])
-echoShard who = queryShard who pure
+oneshotShard cfg who = do
+  cli <- agentCli cfg
+  cliShard who cli
 
 -- | One closed shard turn: commit @ins@, emit replies.
 runShard :: Shard IO [Post] [Post] -> [Post] -> IO [Post]
-runShard sh = runKleisli (close (conjoint sh) (companion sh))
+runShard = runShardIO
