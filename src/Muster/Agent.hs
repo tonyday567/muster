@@ -18,6 +18,7 @@ module Muster.Agent
 
     -- * Living agent as Shard (from 'Circuit.Agent.Cli')
     queryShard,
+    synthShard,
     oneshotShard,
     echoShard,
     runShard,
@@ -41,6 +42,7 @@ import Circuit.Agent.Cli
     replyPosts,
     runShardIO,
     sessionPrompt,
+    synthShard,
   )
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)

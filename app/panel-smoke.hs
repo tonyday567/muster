@@ -20,6 +20,7 @@ import Muster.Agent
     Shard,
     queryShard,
     runShard,
+    synthShard,
   )
 import Muster.Api.Bus (ensureChannel, post, readTail, withBus)
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
@@ -91,14 +92,19 @@ main = do
     -- Post every round's replies to the public bus.
     forM_ allRoundPosts $ \o -> post root panelChan (Nick (from o)) (body o)
 
-    -- Synthesizer sees all final-round replies.
+    -- Synthesizer sees all final-round replies and cites every one of them:
+    -- the synth seat is honest by construction (see 'synthShard').
     synthSeat <-
-      queryShard
+      synthShard
         "synth"
         (\prompt -> pure ("synthesis: " <> T.replace "\n" ", " prompt))
     sOuts <- runShard synthSeat finalRoundPosts
 
     assert "synth emits one synthesis" $ length sOuts == 1
+    assert "synthesis ancestry cites every panelist" $
+      case sOuts of
+        [o] -> thread o == ["agent-1", "agent-2", "agent-3"]
+        _ -> False
 
     -- Post synthesis to the bus.
     forM_ sOuts $ \o -> post root panelChan (Nick (from o)) (body o)
