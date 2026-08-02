@@ -307,7 +307,7 @@ runOneShot diagQ cfg = do
   let outPath = adir </> "output.md"
   wakeQueue <- newChan
   diag "scanning for joined channels..."
-  diag "  seat: oneshot Shard IO [Post] [Post] (circuits-agent)"
+  diag "  seat: oneshot Shard IO [Post Text] [Post Text] (circuits-agent)"
   let go :: Map String Channel -> Map String (Async ()) -> IO ()
       go channels watchers = do
         newChannels <- refreshChannels diag cfg channels
@@ -370,8 +370,8 @@ buildPipeline ::
   FilePath ->
   TChan MetaAction ->
   Map String Channel ->
-  Shard IO [Post] [Post] ->
-  IO (Shard IO [Post] [Post])
+  Shard IO [Post Text] [Post Text] ->
+  IO (Shard IO [Post Text] [Post Text])
 buildPipeline who diagQ outPath metaChan channels mainSeat = do
   f <- filterShard who
   m <- metaShard metaChan diagQ
@@ -385,7 +385,7 @@ handleWake ::
   TQueue Text ->
   Text ->
   FilePath ->
-  Shard IO [Post] [Post] ->
+  Shard IO [Post Text] [Post Text] ->
   TChan MetaAction ->
   Map String Channel ->
   (String, Text, Text) ->
@@ -398,6 +398,7 @@ handleWake diagQ who outPath mainSeat metaChan channels (channel, sender, rawBod
         Post
           { from = sender,
             to = [who, T.pack channel],
+            thread = Nothing,
             body = rawBody
           }
   void $ try @SomeException (runShard pipeline [pIn])

@@ -34,10 +34,10 @@ assert msg ok =
     putStrLn $ "  FAIL " <> msg
     exitFailure
 
-mkPost :: Text -> Text -> Text -> Post
-mkPost a d = Post a [d]
+mkPost :: Text -> Text -> Text -> Post Text
+mkPost a d = Post a [d] Nothing
 
-pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post] [Post])
+pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post Text] [Post Text])
 pureShard who f = queryShard who (pure . f)
 
 main :: IO ()

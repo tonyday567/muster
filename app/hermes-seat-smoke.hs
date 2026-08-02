@@ -29,8 +29,8 @@ import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (hPutStrLn, stderr)
 
-mk :: Text -> Text -> Text -> Post
-mk a d = Post a [d]
+mk :: Text -> Text -> Text -> Post Text
+mk a d = Post a [d] Nothing
 
 main :: IO ()
 main = do

@@ -46,8 +46,8 @@ assert msg ok =
     putStrLn $ "  FAIL " <> msg
     exitFailure
 
-mkPost :: Text -> [Text] -> Text -> Post
-mkPost = Post
+mkPost :: Text -> [Text] -> Text -> Post Text
+mkPost a ds = Post a ds Nothing
 
 main :: IO ()
 main = do
@@ -132,12 +132,12 @@ main = do
 
 -- | Assemble the pipeline for a given bus-sink map.
 buildPipeline ::
-  Shard IO [Post] [Post] ->
+  Shard IO [Post Text] [Post Text] ->
   Map Text (Text -> IO ()) ->
   FilePath ->
   TQueue Text ->
   TChan MetaAction ->
-  IO (Shard IO [Post] [Post])
+  IO (Shard IO [Post Text] [Post Text])
 buildPipeline mainSeat sinks outPath diagQ metaChan = do
   f <- filterShard "echo"
   m <- metaShard metaChan diagQ

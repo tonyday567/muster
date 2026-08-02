@@ -48,8 +48,8 @@ import System.IO (hPutStrLn, stderr)
 defaultRounds :: Int
 defaultRounds = 3
 
-mk :: Text -> Text -> Text -> Post
-mk a d = Post a [d]
+mk :: Text -> Text -> Text -> Post Text
+mk a d = Post a [d] Nothing
 
 assert :: String -> Bool -> IO ()
 assert msg ok =
@@ -63,7 +63,7 @@ assert msg ok =
 --
 -- Each step is one closed 'runShard' turn (commit list, emit list). The
 -- conversation is the posts themselves — multi-round, not oneshot-shaped.
-pingPong :: Int -> Shard IO [Post] [Post] -> Shard IO [Post] [Post] -> Post -> IO [Post]
+pingPong :: Int -> Shard IO [Post Text] [Post Text] -> Shard IO [Post Text] [Post Text] -> Post Text -> IO [Post Text]
 pingPong n seatA seatB seed = go n seed []
   where
     go 0 _ acc = pure (reverse acc)
@@ -78,7 +78,7 @@ pingPong n seatA seatB seed = go n seed []
             (b : _) -> go (k - 1) b (b : a : acc)
 
 -- | Pure seat: @Text -> Text@ with no external process.
-pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post] [Post])
+pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post Text] [Post Text])
 pureShard who f = queryShard who (pure . f)
 
 data Tier = Pure | Mixed | DualHermes | All

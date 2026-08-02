@@ -34,17 +34,18 @@ assert msg ok =
       putStrLn ("  FAIL " ++ msg)
       exitFailure
 
-mk :: Text -> Text -> Text -> Post
-mk a d = Post a [d]
+mk :: Text -> Text -> Text -> Post Text
+mk a d = Post a [d] Nothing
 
 -- | Same decode as circuits-agent-observe: channel is the address.
-decodePost :: Channel -> Text -> Maybe Post
+decodePost :: Channel -> Text -> Maybe (Post Text)
 decodePost chan line = do
   (author', body') <- parseMessage line
   pure
     Post
       { from = author',
         to = [unChannel chan],
+        thread = Nothing,
         body = body'
       }
 

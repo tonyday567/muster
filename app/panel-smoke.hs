@@ -34,16 +34,16 @@ assert msg ok =
     putStrLn $ "  FAIL " <> msg
     exitFailure
 
-mkPost :: Text -> Text -> Text -> Post
-mkPost a d = Post a [d]
+mkPost :: Text -> Text -> Text -> Post Text
+mkPost a d = Post a [d] Nothing
 
-pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post] [Post])
+pureShard :: Text -> (Text -> Text) -> IO (Shard IO [Post Text] [Post Text])
 pureShard who f = queryShard who (pure . f)
 
 -- | Run one round: every agent in the panel sees the same input stream and
 -- emits replies.  Returns the concatenated replies (the public record of the
 -- round).
-runRound :: [Shard IO [Post] [Post]] -> [Post] -> IO [Post]
+runRound :: [Shard IO [Post Text] [Post Text]] -> [Post Text] -> IO [Post Text]
 runRound panel inputs = do
   roundOuts <- forM panel (`runShard` inputs)
   pure (concat roundOuts)

@@ -145,11 +145,11 @@ agentQuery cfg prompt = do
 --
 -- Session file and process stay inside @IO@ — apply-only at this boundary.
 -- @who@ is the agent nick (from on emitted posts).
-oneshotShard :: AgentConfig -> Text -> IO (Shard IO [Post] [Post])
+oneshotShard :: AgentConfig -> Text -> IO (Shard IO [Post Text] [Post Text])
 oneshotShard cfg who = do
   cli <- agentCli cfg
   cliShard who cli
 
 -- | One closed shard turn: commit @ins@, emit replies.
-runShard :: Shard IO [Post] [Post] -> [Post] -> IO [Post]
+runShard :: Shard IO [Post Text] [Post Text] -> [Post Text] -> IO [Post Text]
 runShard = runShardIO
