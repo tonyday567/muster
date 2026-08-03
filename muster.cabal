@@ -75,6 +75,7 @@ library
         Muster.Agent.Seat
         Muster.Connector
         Muster.Diagram
+        Muster.Runner.Card
         Muster.Ws
 
     build-depends:
@@ -330,6 +331,32 @@ executable muster-meeting-runner
         string-diagrams,
         text,
         warp
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
+-- L4b: runner-protocol harness.  Reads an agent card, posts with runner marks,
+-- and drives a lead/coder pair on the live bus.  Default agents are deterministic
+-- mocks; pass --agent kimi (or grok/hermes) to use a real CLI seat.
+executable muster-runner-smoke
+    import:           warnings
+
+    main-is:          runner-smoke.hs
+
+    ghc-options: -threaded
+
+    build-depends:
+        base,
+        async,
+        circuits-agent,
+        directory,
+        filepath,
+        free-agent,
+        muster,
+        optparse-applicative,
+        process,
+        text
 
     hs-source-dirs:   app
 
