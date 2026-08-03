@@ -26,9 +26,7 @@ import Control.Concurrent.Async (async, cancel, race, waitCatch)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
 import Control.Monad (forM_, forever)
-import Data.Aeson (Value (..), decode)
-import Data.Aeson.KeyMap qualified as KM
-import Data.ByteString.Lazy qualified as LBS
+import Circuit.Parser.Json (Json (..), decodeJson)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -64,28 +62,28 @@ data Msg
   | MsgOther
 
 parseMsg :: Text -> Msg
-parseMsg t = case decode (LBS.fromStrict (encodeUtf8 t)) of
-  Just (Object o) ->
-    case KM.lookup "type" o of
-      Just (String "post") ->
+parseMsg t = case decodeJson (encodeUtf8 t) of
+  Right (JObject o) ->
+    case lookup "type" o of
+      Just (JString "post") ->
         MsgPost
-          (KM.lookup "history" o == Just (Bool True))
-          (case KM.lookup "n" o of
-             Just (Number n) -> floor n
+          (lookup "history" o == Just (JBool True))
+          (case lookup "n" o of
+             Just (JNumber n) -> round n
              _ -> -1)
-          (case KM.lookup "sender" o of
-             Just (String s) -> Just s
+          (case lookup "sender" o of
+             Just (JString s) -> Just s
              _ -> Nothing)
-          (case KM.lookup "body" o of
-             Just (String b) -> Just b
+          (case lookup "body" o of
+             Just (JString b) -> Just b
              _ -> Nothing)
-      Just (String "error") ->
-        MsgError (case KM.lookup "message" o of
-                    Just (String m) -> m
+      Just (JString "error") ->
+        MsgError (case lookup "message" o of
+                    Just (JString m) -> m
                     _ -> "")
-      Just (String "diagram") ->
-        MsgDiagram (case KM.lookup "channel" o of
-                      Just (String c) -> c
+      Just (JString "diagram") ->
+        MsgDiagram (case lookup "channel" o of
+                      Just (JString c) -> c
                       _ -> "")
       _ -> MsgOther
   _ -> MsgOther

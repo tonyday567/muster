@@ -35,8 +35,8 @@ import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
 import Control.Concurrent.STM
 import Control.Exception (IOException, SomeException, displayException, finally, try)
 import Control.Monad (filterM, forever, void, when)
+import Circuit.Parser.Json (Json (..), encodeJson)
 import Cursor qualified as Cur
-import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as LBS
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -370,13 +370,13 @@ staticApp cfg req respond =
       let chan = queryChannel cfg req
       posts <- readMeetingPosts (wcBusRoot cfg </> T.unpack chan) (wcHistory cfg)
       let body =
-            encode
-              ( object
-                  [ "channel" .= chan,
-                    "lines" .= length posts,
-                    "skeleton" .= diagramJson (meetingSkeleton posts)
+            LBS.fromStrict $
+              encodeJson $
+                JObject
+                  [ ("channel", JString chan),
+                    ("lines", JNumber (fromIntegral (length posts))),
+                    ("skeleton", diagramJson (meetingSkeleton posts))
                   ]
-              )
       respond $
         responseLBS
           status200

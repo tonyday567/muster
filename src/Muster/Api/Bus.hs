@@ -48,9 +48,8 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import Control.Exception (IOException, SomeException, bracket, catch, finally, try)
 import Control.Monad (forever, forM, unless, void, when)
-import Data.Aeson (encode, object, (.=))
+import Circuit.Parser.Json (Json (..), encodeJson)
 import Data.ByteString qualified as BS
-import Data.ByteString.Lazy qualified as LBS
 import Data.Char (isSpace)
 import Data.Map.Strict (Map)
 import Data.Maybe (catMaybes)
@@ -62,6 +61,7 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Text.Encoding (encodeUtf8)
 import Data.Time.Clock (getCurrentTime)
+import Data.Vector qualified as V
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
 import Muster.Bus qualified as Bus
 import Muster.Cursor qualified as Cur
@@ -444,12 +444,12 @@ postWithThread :: BusRoot -> Channel -> Nick -> [Text] -> Text -> IO ()
 postWithThread root chan nick thread body = do
   post root chan nick body
   let entry =
-        object
-          [ "from" .= unNick nick,
-            "thread" .= thread,
-            "body" .= body
+        JObject
+          [ ("from", JString (unNick nick)),
+            ("thread", JArray (V.fromList (map JString thread))),
+            ("body", JString body)
           ]
-      line = LBS.toStrict (encode entry) <> "\n"
+      line = encodeJson entry <> "\n"
   bracket openDag closeFd (writeAll line)
   where
     openDag =

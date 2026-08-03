@@ -79,12 +79,12 @@ library
 
     build-depends:
         base,
-        aeson,
         async,
         bytestring,
         chart-svg,
         circuits >=0.1.0.0 && <0.4,
         circuits-agent,
+        circuits-parser,
         containers,
         directory,
         filepath,
@@ -98,6 +98,7 @@ library
         text,
         time,
         unix,
+        vector,
         wai,
         wai-websockets,
         websockets
@@ -290,9 +291,9 @@ executable muster-ws-smoke
 
     build-depends:
         base,
-        aeson,
         async,
         bytestring,
+        circuits-parser,
         directory,
         filepath,
         muster,

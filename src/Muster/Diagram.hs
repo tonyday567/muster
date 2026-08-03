@@ -21,17 +21,15 @@ where
 
 import Chart (encodeChartOptions)
 import Circuit.Agent (Post (..))
+import Circuit.Parser.Json (Json (..), decodeJson)
 import Circuit.Poly.StringDiagram (SDiagram (..))
 import Cursor qualified as Cur
-import Data.Aeson (Value (..), decode, object, (.=))
-import Data.Aeson.KeyMap qualified as KM
-import Data.Aeson.Types (Pair)
 import Data.ByteString (ByteString)
-import Data.ByteString.Lazy qualified as LBS
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
+import Data.Vector qualified as V
 import Muster.Framing qualified as Framing
 import Strings.Svg.Render (renderSDiagram)
 import System.Directory (doesFileExist)
@@ -48,12 +46,12 @@ data DagEntry = DagEntry
 -- | Parse one @dag.md@ JSON line. Anything malformed is dropped — a
 -- half-written or corrupted line must not kill the whole diagram.
 parseDagEntry :: Text -> Maybe DagEntry
-parseDagEntry line = case decode (LBS.fromStrict (encodeUtf8 line)) of
-  Just (Object o) -> do
-    String f <- KM.lookup "from" o
-    String b <- KM.lookup "body" o
-    ts <- case KM.lookup "thread" o of
-      Just (Array a) -> traverse (\case String t -> Just t; _ -> Nothing) (foldr (:) [] a)
+parseDagEntry line = case decodeJson (encodeUtf8 line) of
+  Right (JObject o) -> do
+    JString f <- lookup "from" o
+    JString b <- lookup "body" o
+    ts <- case lookup "thread" o of
+      Just (JArray a) -> traverse (\case JString t -> Just t; _ -> Nothing) (V.toList a)
       _ -> Nothing
     pure (DagEntry f ts b)
   _ -> Nothing
@@ -106,19 +104,19 @@ readMeetingPosts chanDir histN = do
 -- @{"tag":"box","label":..,"ins":..,"outs":..}@,
 -- @{"tag":"spider","ins":..,"outs":..}@,
 -- @{"tag":"beside","left":..,"right":..}@, and so on.  A plain function,
--- deliberately not a 'Data.Aeson.ToJSON' instance — the skeleton type
--- belongs to string-diagrams and the wire format belongs here.
-diagramJson :: SDiagram -> Value
+-- deliberately not an instance — the skeleton type belongs to
+-- string-diagrams and the wire format belongs here.
+diagramJson :: SDiagram -> Json
 diagramJson = \case
   SWire -> tag "wire" []
-  SBox l i o -> tag "box" ["label" .= l, "ins" .= i, "outs" .= o]
-  SSpider i o -> tag "spider" ["ins" .= i, "outs" .= o]
+  SBox l i o -> tag "box" [("label", JString (T.pack l)), ("ins", jint i), ("outs", jint o)]
+  SSpider i o -> tag "spider" [("ins", jint i), ("outs", jint o)]
   SPrismBox -> tag "prism" []
-  SBeside f g -> tag "beside" ["left" .= diagramJson f, "right" .= diagramJson g]
-  SThenD f g -> tag "then" ["first" .= diagramJson f, "second" .= diagramJson g]
+  SBeside f g -> tag "beside" [("left", diagramJson f), ("right", diagramJson g)]
+  SThenD f g -> tag "then" [("first", diagramJson f), ("second", diagramJson g)]
   SBend -> tag "cup" []
   SBend' -> tag "cap" []
-  STurn f -> tag "turn" ["diagram" .= diagramJson f]
+  STurn f -> tag "turn" [("diagram", diagramJson f)]
   SUnitL -> tag "unitl" []
   SUnitL' -> tag "unitl'" []
   SUnitR -> tag "unitr" []
@@ -127,8 +125,10 @@ diagramJson = \case
   SAssoc' -> tag "assoc'" []
   SSwap -> tag "swap" []
   where
-    tag :: Text -> [Pair] -> Value
-    tag t fs = object (("tag" .= t) : fs)
+    tag :: Text -> [(Text, Json)] -> Json
+    tag t fs = JObject (("tag", JString t) : fs)
+    jint :: Int -> Json
+    jint = JNumber . fromIntegral
 
 -- | Render a skeleton to SVG bytes via strings-svg's 'renderSDiagram'
 -- and chart-svg's 'encodeChartOptions' — the same render path as
