@@ -19,7 +19,8 @@ import Muster.Api.Orchestrator qualified as Orc
 import Muster.Api.Participant qualified as Part
 import Muster.Api.Types (AgentState (..), BusRoot (..), Channel (..), Nick (..), unBusRoot)
 import Muster.Cli.Opts
-  ( busRootOpt,
+  ( boardOpt,
+    busRootOpt,
     channelOpt,
     devOpt,
     nameOpt,
@@ -82,9 +83,9 @@ data AgentCmd
 
 data BusCmd = BusStart | BusStop | BusStatus deriving (Show)
 
--- | Deck process options (port / dev). Channel, name, bus-root come from 'Global'.
+-- | Deck process options (port / dev / board). Channel, name, bus-root come from 'Global'.
 data DeckCmd
-  = DeckStart Int Bool
+  = DeckStart Int Bool FilePath
   | DeckStop
   | DeckStatus
   deriving (Show)
@@ -142,7 +143,7 @@ deckCmdParser =
     ( command
         "start"
         ( info
-            (DeckStart <$> portOpt 9162 <*> devOpt)
+            (DeckStart <$> portOpt 9162 <*> devOpt <*> boardOpt)
             (progDesc "Start the deck web UI (uses global -c/-n/--bus-root)")
         )
         <> command "stop" (info (pure DeckStop) (progDesc "Stop the deck web UI"))
@@ -277,12 +278,12 @@ killPid p = void $ (try (signalProcess sigterm (CPid (fromIntegral p))) :: IO (E
 
 runDeck :: Global -> BusRoot -> DeckCmd -> IO ()
 runDeck global root = \case
-  DeckStart port dev -> runDeckStart global root port dev
+  DeckStart port dev board -> runDeckStart global root port dev board
   DeckStop -> runDeckStop root
   DeckStatus -> runDeckStatus root
 
-runDeckStart :: Global -> BusRoot -> Int -> Bool -> IO ()
-runDeckStart global root port dev = do
+runDeckStart :: Global -> BusRoot -> Int -> Bool -> FilePath -> IO ()
+runDeckStart global root port dev board = do
   let rootPath = unBusRoot root
   createDirectoryIfMissing True rootPath
   let pidPath = deckPidFile rootPath
@@ -306,6 +307,7 @@ runDeckStart global root port dev = do
           rootPath
         ]
           <> [ "--dev" | dev ]
+          <> if null board then [] else ["--board", board]
       sh =
         "nohup muster-ws "
           <> unwords (map shellQuote args)

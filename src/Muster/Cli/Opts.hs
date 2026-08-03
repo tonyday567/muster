@@ -103,7 +103,7 @@ boardOpt =
     ( long "board"
         <> value ""
         <> metavar "FILE"
-        <> help "Board markdown path (default: $HOME/mg/loom/board.md)"
+        <> help "Board markdown path (default: $HOME/coffee/loom/board.md)"
     )
 
 devOpt :: Parser Bool

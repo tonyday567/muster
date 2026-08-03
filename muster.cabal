@@ -362,6 +362,30 @@ executable muster-runner-smoke
 
     default-language: GHC2021
 
+-- L4c: detached live experiment.  Start the bus and two hermes agents,
+-- post a card, then exit.  Observe later with 'status', nudge with 'retry',
+-- tear down with 'stop'.
+executable muster-runner-live
+    import:           warnings
+
+    main-is:          runner-live.hs
+
+    ghc-options: -threaded
+
+    build-depends:
+        base,
+        containers,
+        directory,
+        filepath,
+        muster,
+        optparse-applicative,
+        process,
+        text
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
 executable cabal-repl-muster
     import:           warnings
 

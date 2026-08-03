@@ -16,8 +16,8 @@
 --     by line number — one source (the log), no gap, no duplicates;
 --   * per-client outbound is a bounded 'TBQueue', drop-oldest;
 --   * the commit path is waited: FIFO failures come back as error frames;
---   * bodies containing newlines are rejected (the frame is one line per
---     post — newline injection is log forgery);
+--   * newline characters in bodies are escaped in the frame so the log
+--     stays one line per post;
 --   * the emit port parses once: clients receive structured JSON
 --     (@postJson@) — the deck's regex parser is dead.
 module Muster.Ws
@@ -151,6 +151,12 @@ newChannelEntry root identity chanName = do
     Just c -> pure c
     Nothing ->
       ioError (userError ("muster-ws: bus not answering for channel " <> chanName <> " (FIFO open blocked — is the central daemon running?)"))
+  -- Announce the deck/agent presence in the log. Writing directly to
+  -- the log (rather than via the FIFO) makes the join frame history,
+  -- so connected clients do not see a phantom live post shifting
+  -- message numbers. This fixes the ghost-join bug.
+  ts <- Framing.formatNow
+  TIO.appendFile logf (Framing.frameMessage ts identity ("joined channel " <> T.pack chanName) <> "\n")
   fan <- newBroadcastTChanIO
   -- Private in-memory cursor, complete lines only, absolute numbers.
   -- The Channel's file cursor (.cursor-deck) is deliberately unused:
@@ -266,7 +272,7 @@ clientSession entry chan logf hist conn = do
         writeDropOldest outQ (OutDiagram chan)
   tPost <- async $ forever $ do
     t <- atomically $ readTQueue inQ
-    r <- try @SomeException (handlePost entry outQ t)
+    r <- try @SomeException (handlePost entry t)
     case r of
       Left err ->
         atomically $
@@ -288,14 +294,11 @@ encodeOut (OutPost hist bl) = postJson hist bl
 encodeOut (OutError e) = errorJson e
 encodeOut (OutDiagram chan) = T.concat ["{\"type\":\"diagram\",\"channel\":", jsonStr chan, "}"]
 
--- | The commit path, validated. Multi-line bodies are rejected: the bus
--- frame is one line per post, so a newline is log forgery.
-handlePost :: ChannelEntry -> TBQueue OutMsg -> Text -> IO ()
-handlePost entry outQ t
+-- | The commit path, validated. Empty bodies are dropped; multi-line
+-- content is supported via newline escaping in the frame layer.
+handlePost :: ChannelEntry -> Text -> IO ()
+handlePost entry t
   | T.null body = pure ()
-  | T.any (== '\n') body =
-      atomically $
-        writeDropOldest outQ (OutError "multi-line bodies are not supported on the bus")
   | otherwise = channelSend (ceChannel entry) body
   where
     body = T.strip t

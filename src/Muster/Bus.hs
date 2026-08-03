@@ -37,7 +37,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Muster.Cursor qualified as Cur
-import Muster.Framing (formatNow)
+import Muster.Framing (formatNow, frameMessage)
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
@@ -331,7 +331,7 @@ post dir sender body = do
       before <- countLogLines dir
       ts <- formatNow
       let sender' = T.pack sender
-          framed = "[" <> ts <> "] " <> sender' <> ": " <> body <> "\n"
+          framed = frameMessage ts sender' body <> "\n"
       bracket (openFile (busFifo p) WriteMode) hClose \h -> do
         hSetEncoding h utf8
         hSetBuffering h NoBuffering

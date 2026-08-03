@@ -98,4 +98,4 @@ main = do
 resolveBoard :: FilePath -> IO FilePath
 resolveBoard explicit
   | not (null explicit) = pure explicit
-  | otherwise = (</> "mg/loom/board.md") <$> getEnv "HOME"
+  | otherwise = (</> "coffee/loom/board.md") <$> getEnv "HOME"

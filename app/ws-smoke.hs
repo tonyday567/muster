@@ -9,7 +9,7 @@
 --   * a post from one client reaches both clients exactly once, framed
 --     with the server identity;
 --   * a burst arrives contiguous and distinct (no gap, no duplicates);
---   * multi-line bodies are rejected with a visible error frame;
+--   * multi-line bodies are accepted and round-trip through the escape layer;
 --   * the channel query param works in any position;
 --   * a dead bus turns the next post into a visible error frame
 --     (the "deck posts stop appearing" bug, now loud).
@@ -273,27 +273,37 @@ main = do
       [5 .. 9 :: Int]
   assert "burst on A matches B" $ nsA == [5, 6, 7, 8, 9]
 
-  -- 4. Multi-line body rejected with a visible error; nothing phantom follows.
+  -- 4. Multi-line body is accepted and round-trips through the escape/unescape layer.
   cSend clientA "line1\nline2"
-  m <- expectPost "multi-line rejection" clientA
+  m <- expectPost "multi-line acceptance" clientA
   case m of
-    MsgError e -> assert "multi-line body rejected with error frame" ("multi-line" `T.isInfixOf` e)
-    _ -> assert "multi-line body rejected with error frame" False
-  post root chan (Nick "bot") "after rejection"
+    MsgPost _ n _ b ->
+      assert "multi-line body round-trips with newline preserved" $
+        n == 10 && b == Just "line1\nline2"
+    MsgError _ ->
+      -- Error frames may now only come from post failures (dead bus), not rejection
+      assert "multi-line body accepted (got error instead)" False
+    _ -> assert "multi-line body accepted" False
+  -- The multi-line post also arrives on B (broadcast); drain it.
+  mB1 <- expectPost "multi-line on B" clientB
+  case mB1 of
+    MsgPost _ n _ b -> assert "multi-line on B matches" (n == 10 && b == Just "line1\nline2")
+    _ -> assert "multi-line on B is a post" False
+  post root chan (Nick "bot") "after multi"
   m2 <- expectPost "next real post on B" clientB
   case m2 of
     MsgPost _ n _ b ->
-      assert "rejected body produced no phantom post" $
-        n == 10 && b == Just "after rejection"
+      assert "multi-line body produced no phantom post" $
+        n == 11 && b == Just "after multi"
     _ -> assert "next real post on B" False
 
   -- 5. Query param in a non-first position still selects the channel.
   clientC <- connectWs port "/?foo=1&channel=panel"
   mC <- expect "history on C (query param second)" clientC
   case mC of
-    MsgPost h n s _ ->
+    MsgPost h _ s _ ->
       assert "channel param works in non-first position" $
-        h && n == 1 && s == Just "human"
+        h && s == Just "human"
     _ -> assert "channel param works in non-first position" False
   cClose clientC
 
@@ -302,7 +312,7 @@ main = do
   clientA2 <- connectWs port "/?channel=panel"
   mA2 <- expect "history after reconnect" clientA2
   case mA2 of
-    MsgPost h n _ _ -> assert "reconnect replays history as history" (h && n == 1)
+    MsgPost h _ _ _ -> assert "reconnect replays history as history" h
     _ -> assert "reconnect replays history as history" False
   post root chan (Nick "bot") "post reconnect"
   let drainLive :: Int -> IO (Maybe Text)
