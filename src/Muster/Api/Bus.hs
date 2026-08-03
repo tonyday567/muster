@@ -90,7 +90,7 @@ import System.Posix.IO (OpenFileFlags (..), OpenMode (..), closeFd, defaultFileF
 import System.Posix.IO.ByteString (fdWrite)
 import System.Posix.Process (getProcessID)
 import System.Posix.Signals (sigTERM, signalProcess)
-import System.Posix.Types (CPid (..), ProcessID)
+import System.Posix.Types (CPid (..), Fd, ProcessID)
 import System.Process
   ( CreateProcess (..),
     ProcessHandle,
@@ -292,13 +292,21 @@ ensureChannel root chan = do
     void $
       try @SomeException $
         createNamedPipe (Bus.busFifo p) stdFileMode
-  -- Touch the log files so readers and post's growth check do not race with
-  -- the relay creating them.
-  logExists <- doesFileExist (Bus.busLog p)
-  unless logExists $ appendFile (Bus.busLog p) ""
-  errExists <- doesFileExist (Bus.busErr p)
-  unless errExists $ appendFile (Bus.busErr p) ""
+  -- Touch the log files so readers and post's growth check do not race
+  -- with the relay creating them.  Use a raw POSIX open/close, not GHC's
+  -- 'appendFile': the relay holds these files open as raw fds, and two
+  -- concurrent GHC 'openFile' calls can collide on the RTS lock table.
+  touchFile (Bus.busLog p)
+  touchFile (Bus.busErr p)
   pure dir
+  where
+    touchFile path =
+      void $
+        bracket
+          (openFd path WriteOnly defaultFileFlags {append = True, creat = Just stdFileMode})
+          closeFd
+          (const (pure ()))
+          `catch` \(_ :: IOException) -> pure ()
 
 -- | Wait up to two seconds for a channel relay to come alive.
 --
@@ -326,10 +334,14 @@ channelRelay root chan = do
   -- GHC 'openFile' takes an advisory lock (exclusive for AppendMode) in the
   -- RTS lock table: in-process readers (post's growth check, the ws pump)
   -- then intermittently collide with a per-line open, and the collision
-  -- used to cost the line already consumed from the FIFO.  A raw fd takes
-  -- no GHC lock at all, so readers never see us and no line is lost.
+  -- used to cost the consumed FIFO line.  A raw fd takes no GHC lock at
+  -- all, so readers never see us and no line is lost.  The exception log
+  -- gets the same treatment: the debug err stream is also opened once as a
+  -- raw fd so exception logging cannot itself deadlock on the GHC lock
+  -- table under back-to-back posts.
   bracket openLog closeFd $ \logFd ->
-    forever (relayOnce logFd)
+    bracket openErr closeFd $ \errFd ->
+      forever (relayOnce logFd errFd)
   where
     p = Bus.pathsFor (channelPath root chan)
     openLog =
@@ -337,27 +349,32 @@ channelRelay root chan = do
         (Bus.busLog p)
         WriteOnly
         defaultFileFlags {append = True, creat = Just stdFileMode}
-    relayOnce logFd =
+    openErr =
+      openFd
+        (Bus.busErr p)
+        WriteOnly
+        defaultFileFlags {append = True, creat = Just stdFileMode}
+    relayOnce logFd errFd =
       bracket (openFifo p) hClose (\h -> forever (TIO.hGetLine h >>= appendLine logFd))
-        `catch` \(e :: IOException) -> dbg e
-    dbg :: IOException -> IO ()
-    dbg e = do
+        `catch` \(e :: IOException) -> dbg errFd e
+    dbg :: Fd -> IOException -> IO ()
+    dbg errFd e = do
       ts <- take 19 . show <$> getCurrentTime
       let tag = if isEOFError e then "eof-reopen" else "relay-exception"
-      appendFile (Bus.busErr p) (ts <> " " <> tag <> " " <> show e <> "\n")
+      fdWriteAll errFd (encodeUtf8 (T.pack (ts <> " " <> tag <> " " <> show e <> "\n")))
         `catch` \(_ :: IOException) -> pure ()
     openFifo p' = do
       h <- openFile (Bus.busFifo p') ReadWriteMode
       hSetEncoding h utf8
       hSetBuffering h LineBuffering
       pure h
-    appendLine logFd line = go (encodeUtf8 (line <> "\n"))
-      where
-        go bs
-          | BS.null bs = pure ()
-          | otherwise = do
-              n <- fdWrite logFd bs
-              go (BS.drop (fromIntegral n) bs)
+    appendLine logFd line = fdWriteAll logFd (encodeUtf8 (line <> "\n"))
+    fdWriteAll :: Fd -> BS.ByteString -> IO ()
+    fdWriteAll fd bs
+      | BS.null bs = pure ()
+      | otherwise = do
+          n <- fdWrite fd bs
+          fdWriteAll fd (BS.drop (fromIntegral n) bs)
 
 -- | One scan pass: make sure every existing channel has a live relay thread,
 -- and drop relays for channels that have disappeared.

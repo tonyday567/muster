@@ -307,6 +307,34 @@ executable muster-ws-smoke
 
     default-language: GHC2021
 
+-- L4a: in-process meeting runner over the live bus.
+-- Drives a deterministic roster, posts with thread ancestry, and proves
+-- the live drawing matches the pure meeting semantics.
+executable muster-meeting-runner
+    import:           warnings
+
+    main-is:          meeting-runner-smoke.hs
+
+    ghc-options: -threaded
+
+    build-depends:
+        base,
+        async,
+        bytestring,
+        circuits-agent,
+        directory,
+        filepath,
+        free-agent,
+        muster,
+        process,
+        string-diagrams,
+        text,
+        warp
+
+    hs-source-dirs:   app
+
+    default-language: GHC2021
+
 executable cabal-repl-muster
     import:           warnings
 
