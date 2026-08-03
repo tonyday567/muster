@@ -83,6 +83,27 @@
       white-space: pre-wrap;
       word-break: break-word;
       min-height: 0;
+      min-width: 0;
+    }
+    #panes {
+      display: flex;
+      gap: 0.35rem;
+      min-height: 0;
+    }
+    #diagramPane {
+      flex: 1;
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #diagramPane img {
+      max-width: 100%;
+      max-height: 100%;
     }
     #log .line { margin: 0.1rem 0; }
     #log .line.err { color: #e06c75; }
@@ -166,7 +187,10 @@
     <button type="button" id="reconnect">reconnect</button>
     <span id="hint">same knobs as CLI: channel · name · bus-root · multi-select + watch</span>
   </header>
-  <main id="log">connecting…</main>
+  <div id="panes">
+    <main id="log">connecting…</main>
+    <div id="diagramPane"><img id="diagram" alt="meeting diagram" /></div>
+  </div>
   <form id="compose">
     <textarea id="msg" placeholder="post to selected target channel…"></textarea>
     <div class="row">
@@ -182,6 +206,7 @@
     const identityBadge = document.getElementById('identityBadge');
     const rootBadge = document.getElementById('rootBadge');
     const channelSelect = document.getElementById('channelSelect');
+    const diagramEl = document.getElementById('diagram');
     const processName = window.DEFAULT_NAME || 'deck';
     const processRoot = window.DEFAULT_BUS_ROOT || '';
 
@@ -248,6 +273,18 @@
       return el.scrollHeight - el.scrollTop - el.clientHeight < (px || 48);
     }
 
+    // Diagram pane: full SVG re-send per nudge, cache-busted. A failed
+    // fetch (404/500) just leaves the pane empty; the log is unaffected.
+    function refreshDiagram() {
+      if (!state.post) return;
+      diagramEl.src = '/api/diagram.svg?channel=' + encodeURIComponent(state.post) + '&_=' + Date.now();
+    }
+    diagramEl.onload = () => { diagramEl.style.visibility = 'visible'; };
+    diagramEl.onerror = () => {
+      diagramEl.style.visibility = 'hidden';
+      diagramEl.removeAttribute('src');
+    };
+
     const senderColors = {
       deck: '#4B7FBD',
       kimi: '#C44E8A',
@@ -270,8 +307,9 @@
 
     function append(chan, line) {
       const stick = nearBottom(logEl);
-      // Parse-once protocol: {type:"post",history,n,raw,sender,body} or
-      // {type:"error",message}. Fall back to the raw bus line on anything else.
+      // Parse-once protocol: {type:"post",history,n,raw,sender,body},
+      // {type:"error",message} or {type:"diagram",channel}. Fall back to
+      // the raw bus line on anything else.
       let sender = null;
       let body = null;
       let raw = line;
@@ -289,6 +327,10 @@
           raw = o.raw || line;
         } else if (o && o.type === 'error') {
           errMsg = o.message || 'unknown error';
+        } else if (o && o.type === 'diagram') {
+          // live-growth nudge: refetch the SVG for the post-target channel
+          if (o.channel === state.post) refreshDiagram();
+          return;
         }
       } catch (_) { /* not JSON: treat as a raw bus line */ }
       if (errMsg !== null) {
@@ -423,6 +465,7 @@
       setStatus('down', 'connecting…');
       for (const c of state.channels) connectOne(c);
       updateBadges();
+      refreshDiagram();
     }
 
     function applyFromSelect() {
@@ -471,6 +514,7 @@
       state.post = next;
       writeState(state.channels, state.post, false);
       updateBadges();
+      refreshDiagram();
     });
 
     async function loadChannels() {

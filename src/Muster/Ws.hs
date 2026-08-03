@@ -36,6 +36,7 @@ import Control.Concurrent.STM
 import Control.Exception (IOException, SomeException, displayException, finally, try)
 import Control.Monad (filterM, forever, void, when)
 import Cursor qualified as Cur
+import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as LBS
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -43,6 +44,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Text.IO qualified as TIO
+import Free.Agent.Diagram (meetingSkeleton)
 import Muster.Channel
   ( Channel,
     ChannelConfig (..),
@@ -50,6 +52,7 @@ import Muster.Channel
     channelSend,
     defaultChannelConfig,
   )
+import Muster.Diagram (diagramJson, readMeetingPosts, renderSkeletonSvg)
 import Muster.Framing qualified as Framing
 import Network.HTTP.Types (parseQuery, status200, status400, status404)
 import Network.Wai
@@ -231,7 +234,7 @@ mkApp cfg = do
 outBound :: Natural
 outBound = 1000
 
-data OutMsg = OutPost Bool BusLine | OutError Text
+data OutMsg = OutPost Bool BusLine | OutError Text | OutDiagram Text
 
 clientApp :: WsConfig -> ChannelManager -> ServerApp
 clientApp cfg manager pending = do
@@ -239,10 +242,10 @@ clientApp cfg manager pending = do
   let chan = extractChannelFromWs pending (wcChannel cfg)
   entry <- getOrCreateChannel (wcBusRoot cfg) (wcName cfg) manager chan
   let logf = wcBusRoot cfg </> chan </> "log.md"
-  clientSession entry logf (wcHistory cfg) conn
+  clientSession entry (T.pack chan) logf (wcHistory cfg) conn
 
-clientSession :: ChannelEntry -> FilePath -> Int -> Connection -> IO ()
-clientSession entry logf hist conn = do
+clientSession :: ChannelEntry -> Text -> FilePath -> Int -> Connection -> IO ()
+clientSession entry chan logf hist conn = do
   -- Subscribe BEFORE reading history: the TChan buffers everything from
   -- here on, and the line-number filter below removes the overlap. One
   -- source (the log), no gap, no duplicates.
@@ -255,8 +258,12 @@ clientSession entry logf hist conn = do
   tFan <- async $ forever $ do
     bl <- atomically $ readTChan myFan
     when (blN bl > histMax) $
-      atomically $
+      atomically $ do
         writeDropOldest outQ (OutPost False bl)
+        -- Live growth nudge (launch L3): the deck refetches the SVG on
+        -- this frame.  Cheap on purpose — no SVG in the frame, and a
+        -- full skeleton re-send per post, no incremental patching.
+        writeDropOldest outQ (OutDiagram chan)
   tPost <- async $ forever $ do
     t <- atomically $ readTQueue inQ
     r <- try @SomeException (handlePost entry outQ t)
@@ -279,6 +286,7 @@ clientSession entry logf hist conn = do
 encodeOut :: OutMsg -> Text
 encodeOut (OutPost hist bl) = postJson hist bl
 encodeOut (OutError e) = errorJson e
+encodeOut (OutDiagram chan) = T.concat ["{\"type\":\"diagram\",\"channel\":", jsonStr chan, "}"]
 
 -- | The commit path, validated. Multi-line bodies are rejected: the bus
 -- frame is one line per post, so a newline is log forgery.
@@ -356,6 +364,37 @@ staticApp cfg req respond =
           status200
           [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")]
           (LBS.fromStrict (encodeUtf8 t))
+    -- The meeting skeleton of the log tail as JSON (launch L3): the dag.md
+    -- wiring record aligned over the log, drawn by 'meetingSkeleton'.
+    ["api", "diagram"] -> do
+      let chan = queryChannel cfg req
+      posts <- readMeetingPosts (wcBusRoot cfg </> T.unpack chan) (wcHistory cfg)
+      let body =
+            encode
+              ( object
+                  [ "channel" .= chan,
+                    "lines" .= length posts,
+                    "skeleton" .= diagramJson (meetingSkeleton posts)
+                  ]
+              )
+      respond $
+        responseLBS
+          status200
+          [ ("Content-Type", "application/json; charset=utf-8"),
+            ("Cache-Control", "no-store")
+          ]
+          body
+    -- The same skeleton rendered to SVG (strings-svg -> chart-svg).
+    ["api", "diagram.svg"] -> do
+      let chan = queryChannel cfg req
+      posts <- readMeetingPosts (wcBusRoot cfg </> T.unpack chan) (wcHistory cfg)
+      respond $
+        responseLBS
+          status200
+          [ ("Content-Type", "image/svg+xml"),
+            ("Cache-Control", "no-store")
+          ]
+          (LBS.fromStrict (renderSkeletonSvg (meetingSkeleton posts)))
     ["api", "open"] -> do
       let loomDir = takeDirectory (wcBoard cfg)
           qs = parseQuery (rawQueryString req)
@@ -380,6 +419,13 @@ staticApp cfg req respond =
     _ ->
       respond $
         responseLBS status404 [("Content-Type", "text/plain")] "not found"
+
+-- | The @?channel=@ query parameter, or the server's default channel.
+queryChannel :: WsConfig -> Request -> Text
+queryChannel cfg req =
+  case lookup "channel" (parseQuery (rawQueryString req)) of
+    Just (Just c) -> decodeUtf8 c
+    _ -> T.pack (wcChannel cfg)
 
 -- | List available channel directories under the bus root.
 listChannels :: FilePath -> IO [String]

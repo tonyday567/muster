@@ -36,6 +36,7 @@ module Muster.Api.Bus
 
     -- * Messaging
     post,
+    postWithThread,
     readNext,
     readTail,
   )
@@ -47,7 +48,9 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import Control.Exception (IOException, SomeException, bracket, catch, finally, try)
 import Control.Monad (forever, forM, unless, void, when)
+import Data.Aeson (encode, object, (.=))
 import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as LBS
 import Data.Char (isSpace)
 import Data.Map.Strict (Map)
 import Data.Maybe (catMaybes)
@@ -418,6 +421,47 @@ post root chan nick body = do
   unless ok $ fail $ "muster: bus not running for channel " <> T.unpack (unChannel chan)
   let dir = channelPath root chan
   Bus.post dir (T.unpack (unNick nick)) body
+
+-- | Like 'post' (same waited commit, same failure behaviour), but records
+-- the thread ancestry in a @dag.md@ sidecar: after the log grows, one JSON
+-- line @{"from":sender,"thread":[names],"body":body}@ is appended to
+-- @\<chanDir\>/dag.md@.
+--
+-- The bus log itself carries only @[ts] sender: body@ — ancestry is lost
+-- there, so @dag.md@ is the honest wiring record.  Plain 'post' stays
+-- untouched: dag coverage may be partial, and readers must treat a missing
+-- entry as "no wiring recorded", never as an invented merge.
+--
+-- The append goes through a raw POSIX fd opened in append mode for the
+-- call (O_APPEND), never GHC 'openFile' AppendMode — the RTS lock table
+-- collision that cost lines in the relay applies here too.
+--
+-- dag.md is written /after/ the log commit, so for a single orchestrated
+-- writer its lines are order-aligned with log.md.  Concurrent dag writers
+-- can misalign (two posts interleave log-vs-dag appends); the stage-L4
+-- runner owns that discipline.
+postWithThread :: BusRoot -> Channel -> Nick -> [Text] -> Text -> IO ()
+postWithThread root chan nick thread body = do
+  post root chan nick body
+  let entry =
+        object
+          [ "from" .= unNick nick,
+            "thread" .= thread,
+            "body" .= body
+          ]
+      line = LBS.toStrict (encode entry) <> "\n"
+  bracket openDag closeFd (writeAll line)
+  where
+    openDag =
+      openFd
+        (channelPath root chan </> "dag.md")
+        WriteOnly
+        defaultFileFlags {append = True, creat = Just stdFileMode}
+    writeAll bs fd
+      | BS.null bs = pure ()
+      | otherwise = do
+          n <- fdWrite fd bs
+          writeAll (BS.drop (fromIntegral n) bs) fd
 
 -- | Read all unread lines for a participant on a channel, advancing the cursor.
 readNext :: BusRoot -> Channel -> Nick -> IO [Text]

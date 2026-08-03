@@ -13,6 +13,12 @@
 --   * the channel query param works in any position;
 --   * a dead bus turns the next post into a visible error frame
 --     (the "deck posts stop appearing" bug, now loud).
+--
+-- Launch L3 adds the diagram stage, on a fresh channel after the daemon
+-- is restarted: a wired meeting seeded via 'postWithThread', the
+-- @\/api\/diagram@ and @\/api\/diagram.svg@ endpoints (HTTP via curl —
+-- the smoke has no http-client dep, curl is the simplest client), and
+-- the live-growth @{type:"diagram"}@ nudge frame after a live post.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
@@ -23,11 +29,12 @@ import Control.Monad (forM_, forever)
 import Data.Aeson (Value (..), decode)
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString.Lazy qualified as LBS
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
-import Muster.Api.Bus (centralDaemon, ensureChannel, post)
+import Muster.Api.Bus (centralDaemon, ensureChannel, post, postWithThread)
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
 import Muster.Ws (WsConfig (..), mkApp)
 import Network.Wai.Handler.Warp (defaultSettings, openFreePort, runSettingsSocket)
@@ -36,6 +43,7 @@ import Network.WebSockets (receiveData, sendTextData)
 import System.Directory (createDirectoryIfMissing, removePathForcibly)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
+import System.Process (readProcess)
 import System.Timeout (timeout)
 import Prelude
 
@@ -52,6 +60,7 @@ assert msg ok =
 data Msg
   = MsgPost Bool Int (Maybe Text) (Maybe Text)
   | MsgError Text
+  | MsgDiagram Text
   | MsgOther
 
 parseMsg :: Text -> Msg
@@ -74,6 +83,10 @@ parseMsg t = case decode (LBS.fromStrict (encodeUtf8 t)) of
         MsgError (case KM.lookup "message" o of
                     Just (String m) -> m
                     _ -> "")
+      Just (String "diagram") ->
+        MsgDiagram (case KM.lookup "channel" o of
+                      Just (String c) -> c
+                      _ -> "")
       _ -> MsgOther
   _ -> MsgOther
 
@@ -129,6 +142,49 @@ expect what c = do
       putStrLn ("  FAIL timeout waiting for " ++ what)
       exitFailure
     Just t -> pure (parseMsg t)
+
+-- | Receive frames until the next post frame, skipping diagram nudges
+-- (launch L3: every live post is followed by a @{type:"diagram"}@ frame).
+-- Error frames surface to the caller.
+expectPost :: String -> WsClient -> IO Msg
+expectPost what c = go (20 :: Int)
+  where
+    go 0 = do
+      putStrLn ("  FAIL too many non-post frames waiting for " ++ what)
+      exitFailure
+    go k = do
+      m <- expect what c
+      case m of
+        MsgDiagram _ -> go (k - 1)
+        _ -> pure m
+
+-- | GET via curl: @(status, content-type, body)@.  The smoke has no
+-- http-client dep; curl -i is the simplest possible client here.
+httpGet :: Int -> String -> IO (Int, String, String)
+httpGet port path = do
+  out <- readProcess "curl" ["-sS", "-i", "http://127.0.0.1:" <> show port <> path] ""
+  let (hdrs, body) = splitHeaders out
+      statusLine = takeWhile (/= '\r') hdrs
+      st = case words statusLine of
+        (_ : code : _) -> reads code :: [(Int, String)]
+        _ -> []
+      ct =
+        [ v
+          | l <- lines hdrs,
+            let (k, v0) = break (== ':') l,
+            map toLowerAscii k == "content-type",
+            let v = dropWhile (== ' ') (drop 1 v0)
+        ]
+  pure (case st of [(n, _)] -> n; _ -> -1, concat (take 1 ct), body)
+  where
+    toLowerAscii c = if c >= 'A' && c <= 'Z' then toEnum (fromEnum c + 32) else c
+    splitHeaders s = go "" s
+      where
+        go acc rest
+          | "\r\n\r\n" `isPrefixOf` rest = (reverse acc, drop 4 rest)
+          | otherwise = case rest of
+              [] -> (reverse acc, "")
+              (c : cs) -> go (c : acc) cs
 
 main :: IO ()
 main = do
@@ -197,7 +253,7 @@ main = do
   ns <-
     mapM
       ( \_ -> do
-          m <- expect "burst frame on B" clientB
+          m <- expectPost "burst frame on B" clientB
           case m of
             MsgPost _ n s _ -> do
               assert "burst sender is bot" (s == Just "bot")
@@ -211,7 +267,7 @@ main = do
   nsA <-
     mapM
       ( \_ -> do
-          m <- expect "burst frame on A" clientA
+          m <- expectPost "burst frame on A" clientA
           case m of
             MsgPost _ n _ _ -> pure n
             _ -> assert "burst frame on A is a post" False >> pure (-1)
@@ -221,12 +277,12 @@ main = do
 
   -- 4. Multi-line body rejected with a visible error; nothing phantom follows.
   cSend clientA "line1\nline2"
-  m <- expect "multi-line rejection" clientA
+  m <- expectPost "multi-line rejection" clientA
   case m of
     MsgError e -> assert "multi-line body rejected with error frame" ("multi-line" `T.isInfixOf` e)
     _ -> assert "multi-line body rejected with error frame" False
   post root chan (Nick "bot") "after rejection"
-  m2 <- expect "next real post on B" clientB
+  m2 <- expectPost "next real post on B" clientB
   case m2 of
     MsgPost _ n _ b ->
       assert "rejected body produced no phantom post" $
@@ -266,11 +322,62 @@ main = do
   cancel daemon
   threadDelay 300_000
   cSend clientA2 "doomed"
-  mF <- expect "post failure error frame" clientA2
+  mF <- expectPost "post failure error frame" clientA2
   case mF of
     MsgError e -> assert "dead bus surfaces a post failure" ("post failed" `T.isInfixOf` e)
     _ -> assert "dead bus surfaces a post failure" False
 
   mapM_ cClose [clientA2, clientB]
+
+  -- 8. Diagram stage (launch L3), on a fresh channel with the daemon
+  -- restarted: seed a wired meeting via postWithThread — human root, two
+  -- replies citing human, one synthesis citing both agents.
+  daemon2 <- async (centralDaemon root)
+  let dchan = Channel "diagrams"
+  _ <- ensureChannel root dchan
+  threadDelay 1_500_000
+  postWithThread root dchan (Nick "human") [] "root: what should we do?"
+  postWithThread root dchan (Nick "agent-1") ["human"] "agent-1: factor A"
+  postWithThread root dchan (Nick "agent-2") ["human"] "agent-2: factor B"
+  postWithThread root dchan (Nick "synth") ["agent-1", "agent-2"] "synthesis of both"
+
+  -- (a) the skeleton JSON: a visible merge spider, all four senders.
+  (stD, _ctD, bodyD) <- httpGet port "/api/diagram?channel=diagrams"
+  assert "GET /api/diagram is 200" (stD == 200)
+  assert "diagram JSON mentions a spider (the synthesis merge)" ("\"spider\"" `isInfixOf` bodyD)
+  forM_ ["human", "agent-1", "agent-2", "synth"] $ \s ->
+    assert ("diagram JSON mentions sender " <> s) (s `isInfixOf` bodyD)
+
+  -- (b) the SVG render: svg bytes, no NaN, the synthesis sender label.
+  (stS, ctS, bodyS) <- httpGet port "/api/diagram.svg?channel=diagrams"
+  assert "GET /api/diagram.svg is 200" (stS == 200)
+  assert "diagram.svg is image/svg+xml" ("image/svg+xml" `isInfixOf` ctS)
+  assert "diagram.svg contains <svg" ("<svg" `isInfixOf` bodyS)
+  assert "diagram.svg has no NaN" (not ("NaN" `isInfixOf` bodyS))
+  assert "diagram.svg labels the synthesis sender" ("synth" `isInfixOf` bodyS)
+
+  -- (c) live growth: history frames, then a postWithThread live post,
+  -- then the diagram nudge — after the post frame.
+  clientD <- connectWs port "/?channel=diagrams"
+  forM_ [1 .. 4 :: Int] $ \i -> do
+    mh <- expect ("diagrams history " <> show i) clientD
+    case mh of
+      MsgPost h n _ _ ->
+        assert ("diagrams history frame " <> show i) (h && n == i)
+      _ -> assert ("diagrams history frame " <> show i) False
+  postWithThread root dchan (Nick "agent-1") ["synth"] "agent-1: live follow-up"
+  mP <- expect "live post frame on diagrams" clientD
+  case mP of
+    MsgPost h n s b ->
+      assert "live post on diagrams is numbered and identified" $
+        not h && n == 5 && s == Just "agent-1" && b == Just "agent-1: live follow-up"
+    _ -> assert "live post on diagrams" False
+  mDg <- expect "diagram nudge after the live post" clientD
+  case mDg of
+    MsgDiagram c -> assert "diagram nudge names the channel" (c == "diagrams")
+    _ -> assert "diagram nudge after the live post" False
+  cClose clientD
+  cancel daemon2
+
   cancel server
   putStrLn "muster-ws-smoke: PASS"

@@ -74,21 +74,27 @@ library
         Muster.Agent
         Muster.Agent.Seat
         Muster.Connector
+        Muster.Diagram
         Muster.Ws
 
     build-depends:
         base,
+        aeson,
         async,
         bytestring,
+        chart-svg,
         circuits >=0.1.0.0 && <0.4,
         circuits-agent,
         containers,
         directory,
         filepath,
+        free-agent,
         http-types,
         optparse-applicative,
         process,
         stm,
+        string-diagrams,
+        strings-svg,
         text,
         time,
         unix,
@@ -290,6 +296,7 @@ executable muster-ws-smoke
         directory,
         filepath,
         muster,
+        process,
         stm,
         text,
         warp,
