@@ -218,9 +218,9 @@ If no region is active, send the whole buffer, but only when in
   (setq-local buffer-read-only t))
 
 (defun muster-board--open-card (path)
-  "Open board card PATH relative to the board directory."
+  "Open board card PATH in a new frame."
   (let ((full (expand-file-name path (file-name-directory (muster--board-file)))))
-    (find-file full)))
+    (find-file-other-frame full)))
 
 (defun muster-board--render ()
   "Render the board content into the current buffer."
@@ -234,13 +234,14 @@ If no region is active, send the whole buffer, but only when in
         (let* ((title (car item))
                (path (cadr item))
                (status (nth 2 item))
-               (progress (nth 3 item)))
+               (progress (nth 3 item))
+               (start (point)))
           (insert (format "  %s" title))
           (let ((title-end (point)))
             (when status
               (insert (format "  — %s" status)))
             (insert "\n")
-            (make-text-button (line-beginning-position) title-end
+            (make-text-button start title-end
                               'action (lambda (_btn) (muster-board--open-card path))
                               'follow-link t
                               'help-echo (format "Open %s" path)))
