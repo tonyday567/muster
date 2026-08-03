@@ -8,9 +8,9 @@
 -- roster. Also starts 'muster-ws' and checks that the deck endpoint renders
 -- the meeting live.
 --
--- Optional: set @KIMI_API_KEY@ (and optionally @KIMI_BASE_URL@ /
--- @KIMI_MODEL@) to attach a real LLM seat to a second channel and prove the
--- deck draws it too.
+-- Optional: install the local @kimi@ CLI (or set @KIMI_API_KEY@, optionally
+-- with @KIMI_BASE_URL@ / @KIMI_MODEL@) to attach a real LLM seat to a second
+-- channel and prove the deck draws it too.
 --
 -- curl(1) is used as the HTTP client to keep the executable's dependency
 -- footprint small.
@@ -27,8 +27,9 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Maybe (fromMaybe)
+import Control.Exception (SomeException, try)
 import Free.Agent.Diagram (meetingSkeleton)
-import Free.Agent.Host (HostConfig (..), apiHost, hostRun)
+import Free.Agent.Host (HostConfig (..), apiHost, hostRun, kimiHost)
 import Free.Agent.Meeting (AgentBox (..), meetLog, quoter)
 import Muster.Api.Bus
   ( ensureChannel,
@@ -39,7 +40,7 @@ import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
 import Muster.Diagram (readMeetingPosts, renderSkeletonSvg)
 import Muster.Ws (WsConfig (..), mkApp)
 import Network.Wai.Handler.Warp (defaultSettings, openFreePort, runSettingsSocket)
-import System.Directory (createDirectoryIfMissing, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, findExecutable, removePathForcibly)
 import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
@@ -87,31 +88,31 @@ postPost :: BusRoot -> Channel -> Post Text -> IO ()
 postPost root chan p =
   postWithThread root chan (Nick (from p)) (thread p) (body p)
 
--- | Run a tiny real-agent demo on a fresh channel if KIMI_API_KEY is set.
--- The deterministic structural oracle has already passed; this just proves
--- a live LLM seat can post with ancestry and the deck draws it.
+-- | Run a tiny real-agent demo on a fresh channel if a live agent is available.
+--
+-- Prefer the local @kimi@ CLI; fall back to the OpenAI-compatible API if
+-- @KIMI_API_KEY@ is set; otherwise skip.  The deterministic structural oracle
+-- has already passed; this just proves a live LLM seat can post with ancestry
+-- and the deck draws it.
 runLiveSeatDemo :: BusRoot -> Int -> IO ()
 runLiveSeatDemo root port = do
-  mKey <- lookupEnv "KIMI_API_KEY"
-  case mKey of
-    Nothing -> putStrLn "  SKIP live seat demo (set KIMI_API_KEY to run it)"
-    Just key -> do
-      let liveChan = Channel "live"
+  mKimi <- findExecutable "kimi"
+  case mKimi of
+    Just _ -> runKimiCli
+    Nothing -> do
+      mKey <- lookupEnv "KIMI_API_KEY"
+      case mKey of
+        Nothing -> putStrLn "  SKIP live seat demo (install kimi CLI or set KIMI_API_KEY to run it)"
+        Just key -> runApi key
+  where
+    liveChan = Channel "live"
+    seedBody = "What is one concise thought about composition?"
+
+    setup = do
       _ <- ensureChannel root liveChan
-      let seedBody = "What is one concise thought about composition?"
       postWithThread root liveChan (Nick "human") [] seedBody
-      base <- fromMaybe "https://api.openai.com/v1" <$> lookupEnv "KIMI_BASE_URL"
-      model <- fromMaybe "gpt-4o-mini" <$> lookupEnv "KIMI_MODEL"
-      let cfg =
-            HostConfig
-              { agentName = "kimi",
-                baseUrl = T.pack base,
-                model = T.pack model,
-                key = T.pack key
-              }
-      rs <- hostRun (apiHost cfg "You are a terse assistant.") [seedBody]
-      rsp <- case rs of (r : _) -> pure r; [] -> pure "🔴 empty host response"
-      let note = if T.isPrefixOf "🔴" rsp then " (error response)" else ""
+
+    finish rsp note = do
       postWithThread root liveChan (Nick "kimi") ["human"] rsp
       -- A deterministic synthesiser folds the room.
       postWithThread root liveChan (Nick "synth") ["human", "kimi"] "synth saw the seed and the reply."
@@ -120,6 +121,35 @@ runLiveSeatDemo root port = do
       assert "live deck content-type is svg" $ "image/svg+xml" `isPrefixOf` ct
       assert ("live deck SVG labels kimi" <> note) $ "kimi" `isInfixOf` body
       pass ("live seat demo: kimi posted" <> note)
+
+    runKimiCli = do
+      setup
+      let sessionFile = unBusRoot root </> "kimi-session"
+      mModelEnv <- lookupEnv "KIMI_MODEL"
+      let model = T.pack <$> mModelEnv
+      er <- try @SomeException (hostRun (kimiHost "kimi" model sessionFile) [seedBody])
+      rsp <- case er of
+        Left e -> pure ("🔴 " <> T.pack (show e))
+        Right (r : _) -> pure r
+        Right [] -> pure "🔴 empty host response"
+      let note = if T.isPrefixOf "🔴" rsp then " (error response)" else " (kimi CLI)"
+      finish rsp note
+
+    runApi key = do
+      setup
+      base <- fromMaybe "https://api.openai.com/v1" <$> lookupEnv "KIMI_BASE_URL"
+      apiModel <- fromMaybe "gpt-4o-mini" <$> lookupEnv "KIMI_MODEL"
+      let cfg =
+            HostConfig
+              { agentName = "kimi",
+                baseUrl = T.pack base,
+                model = T.pack apiModel,
+                key = T.pack key
+              }
+      rs <- hostRun (apiHost cfg "You are a terse assistant.") [seedBody]
+      rsp <- case rs of (r : _) -> pure r; [] -> pure "🔴 empty host response"
+      let note = if T.isPrefixOf "🔴" rsp then " (error response)" else " (API)"
+      finish rsp note
 
 main :: IO ()
 main = do
