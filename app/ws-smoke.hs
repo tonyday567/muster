@@ -33,12 +33,12 @@ import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Muster.Api.Bus (centralDaemon, ensureChannel, post, postWithThread)
-import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
+import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..), unChannel)
 import Muster.Ws (WsConfig (..), mkApp)
 import Network.Wai.Handler.Warp (defaultSettings, openFreePort, runSettingsSocket)
 import Network.WebSockets.Client (runClient)
 import Network.WebSockets (receiveData, sendTextData)
-import System.Directory (createDirectoryIfMissing, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removePathForcibly)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.Process (readProcess)
@@ -71,7 +71,7 @@ parseMsg t = case decodeJson (encodeUtf8 t) of
           (case lookup "n" o of
              Just (JNumber n) -> round n
              _ -> -1)
-          (case lookup "sender" o of
+          (case lookup "from" o of
              Just (JString s) -> Just s
              _ -> Nothing)
           (case lookup "body" o of
@@ -119,6 +119,25 @@ connectWs port path = do
           }
     Right (Left e) -> fail ("ws client died: " <> show e)
     Right (Right _) -> fail "ws connection closed before ready"
+
+-- | Global line numbers (1-based) of posts addressed to a channel.
+channelLineNumbers :: BusRoot -> Channel -> IO [Int]
+channelLineNumbers root chan = do
+  let logf = unBusRoot root </> "log.jsonl"
+  exists <- doesFileExist logf
+  if not exists
+    then pure []
+    else do
+      raw <- TIO.readFile logf
+      pure [n | (n, l) <- zip [1 ..] (T.lines raw), chanInTo l]
+  where
+    chanInTo l =
+      case decodeJson (encodeUtf8 l) of
+        Right (JObject o) ->
+          case lookup "to" o of
+            Just (JArray xs) -> any (== JString (unChannel chan)) xs
+            _ -> False
+        _ -> False
 
 -- | Poll a predicate until it holds or the patience runs out.
 waitFor :: String -> IO Bool -> IO ()
@@ -189,10 +208,9 @@ main = do
   putStrLn "muster-ws-smoke: two clients, exactly-once, no gap, loud failure"
   let root = BusRoot "/tmp/muster-ws-smoke"
       chan = Channel "panel"
-      chanDir = unBusRoot root </> "panel"
-      logf = chanDir </> "log.md"
+      logf = unBusRoot root </> "log.jsonl"
   removePathForcibly (unBusRoot root)
-  createDirectoryIfMissing True chanDir
+  createDirectoryIfMissing True (unBusRoot root)
 
   daemon <- async (centralDaemon root)
   _ <- ensureChannel root chan
@@ -345,9 +363,9 @@ main = do
   _ <- ensureChannel root dchan
   threadDelay 1_500_000
   postWithThread root dchan (Nick "human") [] "root: what should we do?"
-  postWithThread root dchan (Nick "agent-1") ["human"] "agent-1: factor A"
-  postWithThread root dchan (Nick "agent-2") ["human"] "agent-2: factor B"
-  postWithThread root dchan (Nick "synth") ["agent-1", "agent-2"] "synthesis of both"
+  postWithThread root dchan (Nick "agent-1") [0] "agent-1: factor A"
+  postWithThread root dchan (Nick "agent-2") [0] "agent-2: factor B"
+  postWithThread root dchan (Nick "synth") [1, 2] "synthesis of both"
 
   -- (a) the skeleton JSON: a visible merge spider, all four senders.
   (stD, _ctD, bodyD) <- httpGet port "/api/diagram?channel=diagrams"
@@ -366,19 +384,24 @@ main = do
 
   -- (c) live growth: history frames, then a postWithThread live post,
   -- then the diagram nudge — after the post frame.
+  -- Phase 5: line numbers are global. Compute the actual numbers for the
+  -- four diagrams history posts so the oracle matches the shared log.
+  dHistoryNs <- channelLineNumbers root dchan
+  let expectedHistory = take 4 dHistoryNs
+      expectedLive = if null expectedHistory then 0 else last expectedHistory + 1
   clientD <- connectWs port "/?channel=diagrams"
-  forM_ [1 .. 4 :: Int] $ \i -> do
+  forM_ (zip [1 .. 4 :: Int] expectedHistory) $ \(i, expectedN) -> do
     mh <- expect ("diagrams history " <> show i) clientD
     case mh of
       MsgPost h n _ _ ->
-        assert ("diagrams history frame " <> show i) (h && n == i)
+        assert ("diagrams history frame " <> show i) (h && n == expectedN)
       _ -> assert ("diagrams history frame " <> show i) False
-  postWithThread root dchan (Nick "agent-1") ["synth"] "agent-1: live follow-up"
+  postWithThread root dchan (Nick "agent-1") [3] "agent-1: live follow-up"
   mP <- expect "live post frame on diagrams" clientD
   case mP of
     MsgPost h n s b ->
       assert "live post on diagrams is numbered and identified" $
-        not h && n == 5 && s == Just "agent-1" && b == Just "agent-1: live follow-up"
+        not h && n == expectedLive && s == Just "agent-1" && b == Just "agent-1: live follow-up"
     _ -> assert "live post on diagrams" False
   mDg <- expect "diagram nudge after the live post" clientD
   case mDg of

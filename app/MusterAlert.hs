@@ -89,9 +89,10 @@ parseArgs args = go args defaultCfg
 runAlert :: AlertConfig -> IO ()
 runAlert cfg = do
   root <- if null (acRoot cfg) then Config.musterHome else pure (acRoot cfg)
-  let dir = root </> acChannel cfg
-      cursorFile = dir </> ".watch-" <> acName cfg
-      joinCursor = dir </> ".cursor-" <> acName cfg
+  let cursorFile = root </> ".watch-" <> acName cfg
+      joinCursor = root </> ".cursor-" <> acName cfg
+      logPath = root </> "log.jsonl"
+      channel = T.pack (acChannel cfg)
 
   -- Idempotency: don't wake a woken agent.
   case acLock cfg of
@@ -112,21 +113,23 @@ runAlert cfg = do
         case content of
           Left _ -> do
             c <- Cur.newFile cursorFile
-            _ <- Cur.pollFile c (dir </> "log.md")
+            _ <- Cur.pollFile c logPath
             pure ()
           Right txt -> TIO.writeFile cursorFile txt
       else do
         c <- Cur.newFile cursorFile
-        _ <- Cur.pollFile c (dir </> "log.md")
+        _ <- Cur.pollFile c logPath
         pure ()
 
   let pat = T.pack (acFilter cfg)
       keep line =
-        -- Self-exclude: ignore lines framed by the watcher itself.
-        not (("] " `T.append` T.pack (acName cfg) `T.append` ": ") `T.isInfixOf` line)
+        -- Only wake on traffic for this channel.
+        Bus.matchesChannel channel line
+          && -- Self-exclude: ignore lines framed by the watcher itself.
+          not (("] " `T.append` T.pack (acName cfg) `T.append` ": ") `T.isInfixOf` line)
           && pat `T.isInfixOf` line
 
-  exit <- Bus.wait dir cursorFile (acTimeout cfg) keep
+  exit <- Bus.wait root cursorFile (acTimeout cfg) keep
   case exit of
     ExitSuccess -> do
       -- Bus.wait already printed the matched line(s) to stdout.

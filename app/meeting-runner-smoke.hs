@@ -113,9 +113,9 @@ runLiveSeatDemo root port = do
       postWithThread root liveChan (Nick "human") [] seedBody
 
     finish rsp note = do
-      postWithThread root liveChan (Nick "kimi") ["human"] rsp
+      postWithThread root liveChan (Nick "kimi") [0] rsp
       -- A deterministic synthesiser folds the room.
-      postWithThread root liveChan (Nick "synth") ["human", "kimi"] "synth saw the seed and the reply."
+      postWithThread root liveChan (Nick "synth") [0, 1] "synth saw the seed and the reply."
       (st, ct, body) <- httpGet port "/api/diagram.svg?channel=live"
       assert ("live deck endpoint status 200, got " <> show st) $ st == 200
       assert "live deck content-type is svg" $ "image/svg+xml" `isPrefixOf` ct
@@ -156,10 +156,10 @@ main = do
   putStrLn "muster-meeting-runner: L4a live participation frame"
   let root = BusRoot "/tmp/muster-meeting-runner"
       chan = Channel "panel"
-      chanDir = unBusRoot root </> "panel"
+      chanDir = unBusRoot root
       seed = [Post "human" [] [] "seed question"]
       tagFor i = "agent-" <> T.pack (show (i :: Int))
-      roster = [AgentBox ([], []) (quoter (tagFor i) ("tag-" <> tagFor i)) | i <- [1 .. 3 :: Int]]
+      roster = [AgentBox ([], [], [], []) (quoter (tagFor i) ("tag-" <> tagFor i)) | i <- [1 .. 3 :: Int]]
       rounds = 2
       purePosts = meetLog rounds roster seed
 
@@ -194,8 +194,8 @@ main = do
     server <- async (runSettingsSocket defaultSettings sock app)
     threadDelay 300_000
 
-    -- Read the meeting back from the channel directory.
-    livePosts <- readMeetingPosts chanDir (length purePosts)
+    -- Read the meeting back from the global log, filtered to the channel.
+    livePosts <- readMeetingPosts chanDir (unChannel chan) (length purePosts)
     pass ("pure posts: " <> show (length purePosts) <> ", live posts: " <> show (length livePosts))
     assert "live post count matches pure" $ length livePosts == length purePosts
 

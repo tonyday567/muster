@@ -31,12 +31,13 @@ module Muster.Api.Participant
 where
 
 import Control.Exception (SomeException, try)
-import Control.Monad (void)
+import Control.Monad (unless, void)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Circuit.Agent.Framing (parseLineAt, renderStored)
 import Muster.Api.Bus qualified as Bus
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..), validateNick)
 import Muster.Bus qualified as BusEngine
@@ -53,6 +54,25 @@ import Prelude
 -- "/tmp/muster/.me"
 mePath :: BusRoot -> FilePath
 mePath root = Bus.busRootPath root </> ".me"
+
+-- | Root-level registry of channels a name has joined.
+--
+-- Phase 5: used by agents to discover their channel memberships, since
+-- cursors are now global rather than per-channel.
+joinedChannelsPath :: BusRoot -> Nick -> FilePath
+joinedChannelsPath root nick = Bus.busRootPath root </> ".channels-" <> T.unpack (unNick nick)
+
+-- | Record that @name@ has joined @chan@.
+recordJoinedChannel :: BusRoot -> Nick -> Channel -> IO ()
+recordJoinedChannel root nick chan = do
+  let path = joinedChannelsPath root nick
+  exists <- doesFileExist path
+  old <-
+    if exists
+      then T.lines <$> TIO.readFile path
+      else pure []
+  let c = unChannel chan
+  unless (c `elem` old) $ TIO.appendFile path (c <> "\n")
 
 -- | Path to the caller's current-channel file.
 --
@@ -164,7 +184,7 @@ currentChannel root = do
 -- | Join a channel as the current nick.
 --
 -- The caller must have set a name. A join cursor is created at the current end
--- of the channel log so that 'readNext' only sees new traffic.
+-- of the global log so that 'readNext' only sees new traffic.
 joinChannel :: BusRoot -> Channel -> IO (Either Text ())
 joinChannel root chan = do
   Bus.ensureBusRoot root
@@ -173,10 +193,12 @@ joinChannel root chan = do
     Nothing -> pure $ Left "set a name first (muster name <nick>)"
     Just name -> do
       _ <- Bus.ensureChannel root chan
-      let dir = Bus.channelPath root chan
-          cursor = Bus.cursorPath root chan name
-      total <- BusEngine.countLogLines dir
+      let cursor = Bus.cursorPath root chan name
+      total <- BusEngine.countLogLines (Bus.busRootPath root)
       writeFile cursor (show total <> "\n")
+      -- Maintain a root-level channel registry so agents can discover which
+      -- channels they have joined.
+      recordJoinedChannel root name chan
       void $ claimName root name
       TIO.writeFile (channelStatePath root) (unChannel chan <> "\n")
       pure (Right ())
@@ -194,6 +216,7 @@ leaveChannel root = do
       void $ try @SomeException $ removeFile (channelStatePath root)
     _ -> pure ()
 
+
 -- | Post a message on the current channel as the current nick.
 post :: BusRoot -> Text -> IO (Either Text ())
 post root body = run $ do
@@ -206,14 +229,20 @@ readNext :: BusRoot -> IO (Either Text [Text])
 readNext root = run $ do
   name <- requireName root
   chan <- requireChannel root
-  Bus.readNext root chan name
+  map renderStoredLine <$> Bus.readNext root chan name
 
 -- | Read the last @n@ lines of the current channel.
 readTail :: BusRoot -> Int -> IO (Either Text [Text])
 readTail root n = run $ do
   name <- requireName root
   chan <- requireChannel root
-  Bus.readTail root chan name n
+  map renderStoredLine <$> Bus.readTail root chan name n
+
+renderStoredLine :: Text -> Text
+renderStoredLine line =
+  case parseLineAt 0 line of
+    Just stored -> renderStored stored
+    Nothing -> line
 
 requireName :: BusRoot -> IO Nick
 requireName root = do

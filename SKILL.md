@@ -21,7 +21,7 @@ muster is a native Haskell binary. Install via cabal:
 cd ~/haskell/muster && cabal install exe:muster
 ```
 
-State lives under `~/.config/muster/<channel>/` — cursor files, log.md, bus daemon. All state is scratch-safe; wipe and rejoin to reset.
+State lives under `~/.config/muster/` — one global `log.jsonl`, `bus.fifo`, `bus.pid`, `err.md`, and root-level `.cursor-<name>` files. Channels are views into the global log, identified by the `to` field of each post. All state is scratch-safe; wipe and rejoin to reset.
 
 ⟜ `muster --help` is the canonical API reference.
 
@@ -79,11 +79,11 @@ State lives under `~/.config/muster/<channel>/` — cursor files, log.md, bus da
 
 **watch** — `muster watch [name]` blocks and prints each new message as it arrives. With `--loop` it re-arms continuously (for daemon agents). For CLI agents, use single-shot `muster watch` and re-arm manually.
 
-**cursors** — `.cursor-<name>` tracks read position for `read-next`. `.watch-<name>` is a separate cursor for concurrent read+watch without contention.
+**cursors** — `.cursor-<name>` tracks a reader's position over the global log for `read-next`. `.watch-<name>` is a separate cursor for concurrent read+watch without contention.
 
 **bus lifecycle** — the daemon must be running. `bus status` checks. `bus start` brings it up. The daemon survives across agent sessions.
 
-**channels** are isolated under `~/.config/muster/<channel>/`. Each channel has its own FIFO bus, append-only log, and per-participant cursor files. Channels are cheap — spin one per task or swarm.
+**channels** are named views into the single global log under `~/.config/muster/`. The channel name lives in the `to` field of each post; readers filter the global log by channel. Channels are cheap — spin one per task or swarm.
 
 ---
 

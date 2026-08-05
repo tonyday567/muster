@@ -58,12 +58,14 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, try)
 import Control.Monad (unless, void, when)
 import Data.Char (isDigit, isSpace)
-import Data.List (dropWhileEnd, intercalate, isPrefixOf, sort)
+import Data.List (dropWhileEnd, intercalate, isPrefixOf, nub, sort)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time (defaultTimeLocale, addUTCTime, formatTime, getCurrentTime)
+import Circuit.Agent (Post (..))
+import Circuit.Agent.Framing (Stamped (..), parseLineAt, parseMessageTs)
 import Muster.Bus qualified as Bus
 import Options.Applicative
 import System.Directory
@@ -125,13 +127,14 @@ busRoot (Global _ root)
   | not (null root) = pure root
 busRoot _ = (</> ".config/muster") <$> getEnv "HOME"
 
--- | Directory for a specific channel.
+-- | Bus root directory.
+--
+-- Phase 5: channels are no longer subdirectories; the channel label is carried
+-- in each post's @to@ field.
 channelDir :: Global -> IO FilePath
-channelDir opts = do
-  root <- busRoot opts
-  pure (root </> globalChannel opts)
+channelDir = busRoot
 
--- | Cursor file for a participant inside a channel directory.
+-- | Cursor file for a participant inside the bus root.
 cursorFile :: FilePath -> String -> FilePath
 cursorFile dir name = dir </> ".cursor-" <> name
 
@@ -141,13 +144,13 @@ cursorFile dir name = dir </> ".cursor-" <> name
 watchCursorFile :: FilePath -> String -> FilePath
 watchCursorFile dir name = dir </> ".watch-" <> name
 
--- | Log file path inside a channel directory.
+-- | Global log file path under the bus root.
 logFile :: FilePath -> FilePath
-logFile dir = dir </> "log.md"
+logFile dir = Bus.busLog (Bus.pathsFor dir)
 
--- | Session metadata file inside a channel directory.
-sessionFile :: FilePath -> FilePath
-sessionFile dir = dir </> "session.md"
+-- | Session metadata file under the bus root, per-channel.
+sessionFile :: FilePath -> String -> FilePath
+sessionFile dir channel = dir </> "session-" <> channel <> ".md"
 
 -- | Session state persisted to @session.md@.
 data SessionState = SessionState
@@ -574,13 +577,10 @@ optionsParser =
 
 runBus :: Global -> BusCmd -> IO ()
 runBus opts = \case
-  BusStart -> do
-    dir <- channelDir opts
-    root <- busRoot opts
-    Bus.busStart dir (globalChannel opts) root
-  BusStop -> channelDir opts >>= Bus.busStop
-  BusStatus -> channelDir opts >>= Bus.busStatus
-  BusDaemon -> channelDir opts >>= Bus.busDaemon
+  BusStart -> busRoot opts >>= Bus.busStart
+  BusStop -> busRoot opts >>= Bus.busStop
+  BusStatus -> busRoot opts >>= Bus.busStatus
+  BusDaemon -> busRoot opts >>= Bus.busDaemon
 
 runJoin :: Global -> String -> IO ()
 runJoin opts name = do
@@ -595,11 +595,11 @@ runJoin opts name = do
       writeFile cursor (show total <> "\n")
       putStrLn $ "[" <> name <> "] joined " <> globalChannel opts <> "; cursor at line " <> show total
   -- If a session is open on this channel, add the participant.
-  ms <- readSession (sessionFile dir)
+  ms <- readSession (sessionFile dir (globalChannel opts))
   case ms of
     Just s | sessStatus s == "open" && name `notElem` sessParticipants s -> do
       let s' = s {sessParticipants = sort (name : sessParticipants s)}
-      writeSession (sessionFile dir) s'
+      writeSession (sessionFile dir (globalChannel opts)) s'
     _ -> pure ()
 
 runLeave :: Global -> String -> IO ()
@@ -619,7 +619,8 @@ runPost opts args = do
     hPutStrLn stderr "muster: empty message"
     exitWith (ExitFailure 1)
   dir <- channelDir opts
-  Bus.post dir name msg
+  let chan = T.pack (globalChannel opts)
+  Bus.post dir (T.pack name) [chan] [] msg
 
 requireCursor :: Global -> String -> IO FilePath
 requireCursor opts name = do
@@ -636,9 +637,10 @@ runRead opts mname mtail allFlag = do
   name <- resolveName opts mname
   cursor <- requireCursor opts name
   dir <- channelDir opts
+  let chan = T.pack (globalChannel opts)
   if allFlag
-    then Bus.readNew dir cursor
-    else Bus.readTail dir cursor (fromMaybe 20 mtail)
+    then Bus.readNew dir cursor chan
+    else Bus.readTail dir cursor (fromMaybe 20 mtail) chan
 
 -- | Cursor participant names in a channel directory (sorted).
 cursorNames :: FilePath -> IO [String]
@@ -738,7 +740,8 @@ runWatch opts mname mto mfilter msince loopMode = do
   exists <- doesFileExist wc
   unless exists $ initWatchCursor dir joinCursor wc
   let timeout = fromMaybe 86400 mto
-      -- Build the combined filter from --filter, --since, and self-exclude.
+      chan = T.pack (globalChannel opts)
+      -- Build the combined filter from channel, --filter, --since, and self-exclude.
       selfExclude line =
         not $ (T.pack ("[" <> name <> "] ") `T.isPrefixOf` line)
            || (T.pack ("] " <> name <> ": ") `T.isInfixOf` line)
@@ -755,12 +758,14 @@ runWatch opts mname mto mfilter msince loopMode = do
   let sinceFilter = case cutoffText of
         Nothing -> const True
         Just cutoff -> \line ->
-          case T.stripPrefix "[" line of
+          case parseMessageTs line of
             Nothing -> True
-            Just rest ->
-              case T.breakOn "]" rest of
-                (ts, _) -> T.null ts || ts >= cutoff
-      combined line = selfExclude line && regexFilter line && sinceFilter line
+            Just ts -> ts >= cutoff
+      combined line =
+        Bus.matchesChannel chan line
+          && selfExclude line
+          && regexFilter line
+          && sinceFilter line
       loop = do
         exit <- Bus.wait dir wc timeout combined
         case exit of
@@ -823,11 +828,14 @@ runWho opts = do
           putStrLn $ name <> "  agent  " <> status
 
 runLog :: Global -> IO ()
-runLog opts = channelDir opts >>= Bus.dumpLog
+runLog opts = do
+  dir <- channelDir opts
+  Bus.dumpLog dir (T.pack (globalChannel opts))
 
--- | Wipe a channel: cursors, watches, log, fifo, pid. Bus must be down.
+-- | Wipe the bus root: cursors, watches, log, fifo, pid. Bus must be down.
 --
--- Confirms on stdin unless @--yes@. Does not remove the channel directory.
+-- Phase 5: the log is global, so cleaning a "channel" cleans the whole root.
+-- Confirms on stdin unless @--yes@.
 runClean :: Global -> String -> Bool -> IO ()
 runClean opts channel yes = do
   when (null channel || any isSpace channel || channel == "." || channel == "..") do
@@ -837,28 +845,23 @@ runClean opts channel yes = do
     hPutStrLn stderr $ "muster: refusing to clean reserved path '" <> channel <> "'"
     exitWith (ExitFailure 1)
   root <- busRoot opts
-  let dir = root </> channel
-  exists <- doesDirectoryExist dir
+  exists <- doesDirectoryExist root
   unless exists do
-    hPutStrLn stderr $ "muster: no channel directory " <> dir
+    hPutStrLn stderr $ "muster: no bus root at " <> root
     exitWith (ExitFailure 1)
-  live <- Bus.busLiveness dir
+  live <- Bus.busLiveness root
   unless (live == "down") do
     hPutStrLn stderr $
       "muster: bus is "
         <> live
-        <> " on "
-        <> channel
-        <> " — stop it first (muster -c "
-        <> channel
-        <> " bus stop)"
+        <> " — stop it first (muster bus stop)"
     exitWith (ExitFailure 1)
-  nLines <- Bus.countLogLines dir
-  nParts <- length <$> cursorNames dir
+  nLines <- Bus.countLogLines root
+  nParts <- length <$> cursorNames root
   unless yes do
     putStr $
-      "Wipe channel "
-        <> channel
+      "Wipe bus root "
+        <> root
         <> " ("
         <> show nLines
         <> " lines, "
@@ -869,19 +872,20 @@ runClean opts channel yes = do
     unless (ans == "y" || ans == "Y" || ans == "yes") do
       putStrLn "aborted"
       exitWith (ExitFailure 1)
-  entries <- listDirectory dir
+  entries <- listDirectory root
   let wipe =
         [ e
         | e <- entries
         , ".cursor-" `isPrefixOf` e
             || ".watch-" `isPrefixOf` e
             || ".watch.pid-" `isPrefixOf` e
-            || e `elem` ["log.md", "err.md", "bus.pid", "bus.fifo"]
+            || e `elem` ["log.jsonl", "err.md", "bus.pid", "bus.fifo"]
+            || "session-" `isPrefixOf` e && ".md" `isSuffixOf` e
         ]
-  mapM_ (\e -> removePathForcibly (dir </> e)) wipe
+  mapM_ (\e -> removePathForcibly (root </> e)) wipe
   putStrLn $
     "cleaned "
-      <> channel
+      <> root
       <> " ("
       <> show (length wipe)
       <> " files removed; "
@@ -892,41 +896,31 @@ runClean opts channel yes = do
 
 -- | Archive old log lines, retain the newest @keep@, reset join/watch cursors.
 --
--- Bus must be down (rewriting @log.md@ under a live daemon races).  Dropped
--- lines are appended to @log-archive.md@ with a separator header.
+-- Phase 5: operates on the global log.  Bus must be down (rewriting
+-- @log.jsonl@ under a live daemon races).  Dropped lines are appended to
+-- @log-archive.md@ with a separator header.
 runPrune :: Global -> String -> Int -> Bool -> IO ()
-runPrune opts channel keep yes = do
-  when (null channel || any isSpace channel || channel == "." || channel == "..") do
-    hPutStrLn stderr $ "muster: invalid channel '" <> channel <> "'"
-    exitWith (ExitFailure 1)
-  when ("_" `isPrefixOf` channel) do
-    hPutStrLn stderr $ "muster: refusing to prune reserved path '" <> channel <> "'"
-    exitWith (ExitFailure 1)
+runPrune opts _channel keep yes = do
   when (keep < 0) do
     hPutStrLn stderr "muster: --keep must be >= 0"
     exitWith (ExitFailure 1)
   root <- busRoot opts
-  let dir = root </> channel
-      logPath = logFile dir
-      archivePath = dir </> "log-archive.md"
-  exists <- doesDirectoryExist dir
+  let logPath = logFile root
+      archivePath = root </> "log-archive.md"
+  exists <- doesDirectoryExist root
   unless exists do
-    hPutStrLn stderr $ "muster: no channel directory " <> dir
+    hPutStrLn stderr $ "muster: no bus root at " <> root
     exitWith (ExitFailure 1)
-  live <- Bus.busLiveness dir
+  live <- Bus.busLiveness root
   unless (live == "down") do
     hPutStrLn stderr $
       "muster: bus is "
         <> live
-        <> " on "
-        <> channel
-        <> " — stop it first (muster -c "
-        <> channel
-        <> " bus stop)"
+        <> " — stop it first (muster bus stop)"
     exitWith (ExitFailure 1)
   hasLog <- doesFileExist logPath
   if not hasLog
-    then putStrLn $ "prune: no log.md in " <> channel <> " — nothing to do"
+    then putStrLn $ "prune: no log.jsonl at " <> root <> " — nothing to do"
     else do
       raw <- TIO.readFile logPath
       let ls = T.lines raw
@@ -936,9 +930,7 @@ runPrune opts channel keep yes = do
       if dropN == 0
         then
           putStrLn $
-            "prune: "
-              <> channel
-              <> " already within keep="
+            "prune: already within keep="
               <> show keep
               <> " ("
               <> show total
@@ -946,9 +938,7 @@ runPrune opts channel keep yes = do
         else do
           unless yes do
             putStr $
-              "Prune "
-                <> channel
-                <> " (drop "
+              "Prune global log (drop "
                 <> show dropN
                 <> ", keep "
                 <> show (length kept)
@@ -977,18 +967,16 @@ runPrune opts channel keep yes = do
           TIO.appendFile archivePath archived
           TIO.writeFile logPath newLog
           -- Reset join + watch cursors to the new tail so nothing re-fires as "new".
-          entries <- listDirectory dir
+          entries <- listDirectory root
           let cursors =
                 [ e
                 | e <- entries
                 , ".cursor-" `isPrefixOf` e || ".watch-" `isPrefixOf` e
                 ]
               newPos = length kept
-          mapM_ (\e -> writeFile (dir </> e) (show newPos <> "\n")) cursors
+          mapM_ (\e -> writeFile (root </> e) (show newPos <> "\n")) cursors
           putStrLn $
-            "pruned "
-              <> channel
-              <> ": dropped "
+            "pruned global log: dropped "
               <> show dropN
               <> ", kept "
               <> show newPos
@@ -998,9 +986,9 @@ runPrune opts channel keep yes = do
               <> show (length cursors)
               <> " cursors"
 
--- | List every channel under the bus root that has a @log.md@.
+-- | List every channel that has traffic in the global log.
 --
--- Output (aligned columns):
+-- Phase 5: channels are views, not directories.  Output (aligned columns):
 --
 -- > general      152 lines  6 participants  alive (pid 12044)
 -- > engine-test    3 lines  2 participants  down
@@ -1011,32 +999,44 @@ runChannels opts = do
   unless exists do
     hPutStrLn stderr $ "muster: no bus root at " <> root
     exitWith (ExitFailure 1)
-  entries <- listDirectory root
-  let candidates = sort entries
-  rows <- concat <$> mapM (channelRow root) candidates
-  case rows of
+  chans <- channelNames root
+  nLines <- Bus.countLogLines root
+  nParts <- countParticipants root
+  live <- Bus.busLiveness root
+  case chans of
     [] -> putStrLn $ "no channels under " <> root
     _ -> do
-      let w = maximum (map (\(n, _, _, _) -> length n) rows)
-      mapM_ (putStrLn . formatRow w) rows
+      let w = maximum (map length chans)
+          row name = formatRow w (name, nLines, nParts, live)
+      mapM_ (putStrLn . row) chans
   where
-    channelRow :: FilePath -> FilePath -> IO [(String, Int, Int, String)]
-    channelRow root name = do
-      let dir = root </> name
-      isDir <- doesDirectoryExist dir
-      hasLog <- doesFileExist (logFile dir)
-      if isDir && hasLog
-        then do
-          nLines <- Bus.countLogLines dir
-          nParts <- countParticipants dir
-          live <- Bus.busLiveness dir
-          pure [(name, nLines, nParts, live)]
-        else pure []
+    channelNames :: FilePath -> IO [String]
+    channelNames root = do
+      let p = logFile root
+      exists <- doesFileExist p
+      if not exists
+        then pure []
+        else do
+          raw <- TIO.readFile p
+          pure
+            $ sort
+            $ nub
+            $ concat
+              [ map T.unpack (to stored)
+                | l <- T.lines raw,
+                  Just stored <- [parseStored l]
+              ]
+
+    parseStored l = stamped <$> parseLineAt 0 l
 
     countParticipants :: FilePath -> IO Int
     countParticipants dir = do
-      es <- listDirectory dir
-      pure $ length [e | e <- es, ".cursor-" `isPrefixOf` e]
+      exists <- doesDirectoryExist dir
+      if not exists
+        then pure 0
+        else do
+          es <- listDirectory dir
+          pure $ length [e | e <- es, ".cursor-" `isPrefixOf` e]
 
     formatRow :: Int -> (String, Int, Int, String) -> String
     formatRow w (name, nLines, nParts, live) =
@@ -1063,9 +1063,8 @@ runSessionOpen :: Global -> IO ()
 runSessionOpen opts = do
   dir <- channelDir opts
   createDirectoryIfMissing True dir
-  root <- busRoot opts
-  Bus.busStart dir (globalChannel opts) root
-  ms <- readSession (sessionFile dir)
+  Bus.busStart dir
+  ms <- readSession (sessionFile dir (globalChannel opts))
   case ms of
     Just s | sessStatus s == "open" ->
       putStrLn $ "session already open on " <> globalChannel opts <> " (since " <> sessOpened s <> ")"
@@ -1073,13 +1072,13 @@ runSessionOpen opts = do
       n <- Bus.countLogLines dir
       t <- nowIso
       let s = SessionState {sessStatus = "open", sessOpened = t, sessParticipants = [], sessLogStart = n}
-      writeSession (sessionFile dir) s
+      writeSession (sessionFile dir (globalChannel opts)) s
       putStrLn $ "session opened on " <> globalChannel opts <> " at line " <> show n
 
 runSessionClose :: Global -> IO ()
 runSessionClose opts = do
   dir <- channelDir opts
-  ms <- readSession (sessionFile dir)
+  ms <- readSession (sessionFile dir (globalChannel opts))
   case ms of
     Nothing -> putStrLn $ "no session on " <> globalChannel opts
     Just s | sessStatus s /= "open" ->
@@ -1087,12 +1086,14 @@ runSessionClose opts = do
     Just s -> do
       let logPath = logFile dir
           archivePath = dir </> "log-archive.md"
+          chan = T.pack (globalChannel opts)
       hasLog <- doesFileExist logPath
       when hasLog do
         raw <- TIO.readFile logPath
         let ls = T.lines raw
             start = sessLogStart s
-            (kept, dropped) = splitAt start ls
+            allKept = filter (Bus.matchesChannel chan) ls
+            (kept, dropped) = splitAt start allKept
         -- Archive lines from log-start to end.
         unless (null dropped) do
           let archiveHeader = T.pack $ "\n--- session close " <> globalChannel opts <> " opened=" <> sessOpened s <> " ---\n"
@@ -1106,14 +1107,14 @@ runSessionClose opts = do
         mapM_ (\e -> writeFile (dir </> e) (show newPos <> "\n")) cursors
       t <- nowIso
       let s' = s {sessStatus = "closed", sessOpened = sessOpened s <> "; closed: " <> t}
-      writeSession (sessionFile dir) s'
+      writeSession (sessionFile dir (globalChannel opts)) s'
       Bus.busStop dir
       putStrLn $ "session closed on " <> globalChannel opts
 
 runSessionStatus :: Global -> IO ()
 runSessionStatus opts = do
   dir <- channelDir opts
-  ms <- readSession (sessionFile dir)
+  ms <- readSession (sessionFile dir (globalChannel opts))
   case ms of
     Nothing -> putStrLn $ "no session on " <> globalChannel opts
     Just s -> do
@@ -1131,15 +1132,16 @@ runSessionList opts = do
     hPutStrLn stderr $ "muster: no bus root at " <> root
     exitWith (ExitFailure 1)
   entries <- listDirectory root
-  let dirs = sort entries
-  rows <- concat <$> mapM (\n -> sessionRow (root </> n) n) dirs
+  let sessionFiles = sort [e | e <- entries, "session-" `isPrefixOf` e, ".md" `isSuffixOf` e]
+  rows <- concat <$> mapM (sessionRow root) sessionFiles
   if null rows
     then putStrLn "no open sessions"
     else mapM_ putStrLn rows
   where
-    sessionRow :: FilePath -> String -> IO [String]
-    sessionRow dir name = do
-      ms <- readSession (sessionFile dir)
+    sessionRow :: FilePath -> FilePath -> IO [String]
+    sessionRow root path = do
+      ms <- readSession (root </> path)
+      let name = drop 8 (take (length path - 3) path)
       case ms of
         Just s | sessStatus s == "open" ->
           pure [name <> "  open  " <> sessOpened s <> "  [" <> unwords (sessParticipants s) <> "]"]

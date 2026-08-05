@@ -7,6 +7,10 @@
 -- Product-side channel transport over the native muster bus: layout + daemon
 -- ownership here; framing and cursor core from 'circuits-agent'. Does not use
 -- 'Circuit.Agent.Comm' (cat-FIFO absorb leftover).
+--
+-- Phase 5: paths are root-level.  The channel label is still carried in
+-- 'ChannelConfig' but the directory is the bus root; readers filter the global
+-- log by channel name.
 module Muster.Channel
   ( ChannelConfig (..),
     Channel,
@@ -21,15 +25,17 @@ module Muster.Channel
   )
 where
 
+import Circuit.Agent (Post (..))
+import Circuit.Agent.Framing (framePost, parseMessage)
 import Control.Concurrent (threadDelay)
 import Control.Monad (when)
-import Cursor qualified as Cur
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Cursor qualified as Cur
 import Data.Text.IO qualified as TIO
 import Muster.Bus qualified as Bus
-import Muster.Framing (formatNow, frameMessage, parseMessage)
+import Muster.Bus (matchesChannel)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getEnv)
 import System.FilePath ((</>))
@@ -56,11 +62,11 @@ data ChannelConfig = ChannelConfig
 
 -- | A connected channel handle.
 --
--- Persistent FIFO write end + file cursor on the channel log. Optional
--- ownership of the per-channel bus start/stop lifecycle.
+-- Persistent FIFO write end + file cursor on the global log. Optional
+-- ownership of the bus start/stop lifecycle.
 data Channel = Channel
   { chCfg :: ChannelConfig,
-    chDir :: FilePath,
+    chRoot :: FilePath,
     chWriteH :: Handle,
     chCursor :: Cur.Cursor,
     chOwnsBus :: Bool
@@ -82,28 +88,29 @@ resolveRoot explicit
   | otherwise = (</> ".config/muster") <$> getEnv "HOME"
 
 -- | Directory for a specific channel.
+--
+-- Phase 5: the channel no longer has its own directory; this returns the bus
+-- root.
 channelDir :: ChannelConfig -> IO FilePath
-channelDir cfg = do
-  root <- resolveRoot (chBusRoot cfg)
-  pure (root </> chChannel cfg)
+channelDir cfg = resolveRoot (chBusRoot cfg)
 
 cursorPath :: ChannelConfig -> FilePath -> FilePath
 cursorPath cfg dir = dir </> ".cursor-" <> T.unpack (chName cfg)
 
 logPath :: FilePath -> FilePath
-logPath dir = dir </> "log.md"
+logPath root = Bus.busLog (Bus.pathsFor root)
 
 fifoPath :: FilePath -> FilePath
-fifoPath dir = dir </> "bus.fifo"
+fifoPath root = Bus.busFifo (Bus.pathsFor root)
 
 -- | Open a channel, starting the bus if necessary.
 --
 -- The returned handle owns the bus daemon. Use 'channelClose' to tear down.
 channelOpen :: ChannelConfig -> IO Channel
 channelOpen cfg = do
-  dir <- channelDir cfg
-  Bus.busStart dir (chChannel cfg) (chBusRoot cfg)
-  ch <- attachDir cfg dir
+  root <- channelDir cfg
+  Bus.busStart root
+  ch <- attachRoot cfg root
   pure ch {chOwnsBus = True}
 
 -- | Attach to an existing channel without starting the bus.
@@ -112,27 +119,27 @@ channelOpen cfg = do
 -- recv only sees future traffic. Existing cursor files resume.
 channelAttach :: ChannelConfig -> IO Channel
 channelAttach cfg = do
-  dir <- channelDir cfg
-  createDirectoryIfMissing True dir
-  attachDir cfg dir
+  root <- channelDir cfg
+  createDirectoryIfMissing True root
+  attachRoot cfg root
 
-attachDir :: ChannelConfig -> FilePath -> IO Channel
-attachDir cfg dir = do
-  let logFile = logPath dir
-      curP = cursorPath cfg dir
+attachRoot :: ChannelConfig -> FilePath -> IO Channel
+attachRoot cfg root = do
+  let logFile = logPath root
+      curP = cursorPath cfg root
   -- Ensure log exists so poll/seek do not race a missing file.
   exists <- doesFileExist logFile
   when (not exists) $ appendFile logFile ""
   c <- Cur.newFile curP
   pos <- Cur.get c
   when (pos == 0) $ Cur.seekEndFile c logFile
-  writeH <- openFile (fifoPath dir) WriteMode
+  writeH <- openFile (fifoPath root) WriteMode
   hSetEncoding writeH utf8
   hSetBuffering writeH NoBuffering
   pure
     Channel
       { chCfg = cfg,
-        chDir = dir,
+        chRoot = root,
         chWriteH = writeH,
         chCursor = c,
         chOwnsBus = False
@@ -142,22 +149,27 @@ attachDir cfg dir = do
 channelClose :: Channel -> IO ()
 channelClose ch = do
   hClose (chWriteH ch)
-  when (chOwnsBus ch) $ Bus.busStop (chDir ch)
+  when (chOwnsBus ch) $ Bus.busStop (chRoot ch)
 
 -- | Send a framed message to the channel.
 channelSend :: Channel -> Text -> IO ()
 channelSend ch body = do
-  ts <- formatNow
-  TIO.hPutStrLn (chWriteH ch) (frameMessage ts (chName (chCfg ch)) body)
+  let name = chName (chCfg ch)
+      chan = T.pack (chChannel (chCfg ch))
+      payload = framePost (Post name [chan] [] body)
+  TIO.hPutStrLn (chWriteH ch) payload
   hFlush (chWriteH ch)
 
--- | Receive all new messages since the last poll.
+-- | Receive all new messages since the last poll, restricted to this channel.
 channelRecv :: Channel -> IO [(Text, Text)]
 channelRecv ch = mapMaybe parseMessage <$> channelRecvRaw ch
 
--- | Receive all new raw log lines since the last poll.
+-- | Receive all new raw log lines since the last poll, filtered to this
+-- channel.
 channelRecvRaw :: Channel -> IO [Text]
-channelRecvRaw ch = Cur.pollFile (chCursor ch) (logPath (chDir ch))
+channelRecvRaw ch =
+  filter (matchesChannel (T.pack (chChannel (chCfg ch))))
+    <$> Cur.pollFile (chCursor ch) (logPath (chRoot ch))
 
 -- | Block until new messages arrive, or the timeout fires (microseconds).
 channelRecvBlocking :: Channel -> Int -> IO (Maybe [(Text, Text)])

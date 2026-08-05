@@ -1,32 +1,34 @@
 ;;; muster-deck.el --- Muster bus UI in Emacs -*- lexical-binding: t; -*-
 
 ;; A minimal Emacs surface for the muster coordination bus.
-;; Three buffers: *muster-board* (top active loom cards),
-;; *muster-log* (tail), and *muster-compose* (write).
+;; Two buffers: *muster-log* (tail) and *muster-post* (write).
+;; The board is a regular file; open it with `muster-board'.
 ;;
 ;; Bind under your preferred leader prefix, e.g.:
 ;;   (map! :leader
 ;;         :prefix ("y" . "muster")
-;;         :desc "send"    "RET" #'muster-send
-;;         :desc "board"   "b"   #'muster-board
-;;         :desc "compose" "m"   #'muster-compose
-;;         :desc "log"     "l"   #'muster-log
-;;         :desc "deck"    "d"   #'muster-deck)
+;;         :desc "send"  "RET" #'muster-send
+;;         :desc "send"  "SPC" #'muster-send
+;;         :desc "board" "b"   #'muster-board
+;;         :desc "post"  "p"   #'muster-post
+;;         :desc "log"   "l"   #'muster-log
+;;         :desc "deck"  "d"   #'muster-deck)
 
 ;;; Commentary:
 
 ;; muster-deck replaces the muster-ws web UI with Emacs buffers.
 ;; The log file remains the single source of truth; the log buffer is a
-;; processed view that unescapes framed newlines so multi-line posts read
-;; naturally.  The board pane reads the top active cards from loom/ and
-;; will eventually retire loom/board.md as the canonical index.
-;; Posts are sent via `muster post' and identity is kept in sync with
-;; `muster-name' by calling `muster name' first.
+;; processed view that renders JSONL messages as `sender: body' (or
+;; `[ts] sender: body' when timestamps are on).  Multi-line posts read
+;; naturally because the body is stored with real newlines.  Posts are
+;; sent via `muster post' from the *muster-post* buffer.  The board file
+;; (`loom/board.md' by default) is just a regular file; open it with
+;; `muster-board'.
 
 ;;; Code:
 
 (require 'filenotify)
-(require 'seq)
+(require 'json)
 
 ;;; Variables
 
@@ -49,8 +51,8 @@
   :type 'string
   :group 'muster-deck)
 
-(defcustom muster-compose-buffer-name "*muster-compose*"
-  "Name of the compose buffer."
+(defcustom muster-post-buffer-name "*muster-post*"
+  "Name of the post buffer."
   :type 'string
   :group 'muster-deck)
 
@@ -59,27 +61,10 @@
   :type 'string
   :group 'muster-deck)
 
-(defcustom muster-board-buffer-name "*muster-board*"
-  "Name of the board buffer."
-  :type 'string
-  :group 'muster-deck)
-
 (defcustom muster-board-file "~/coffee/loom/board.md"
   "Path to the board markdown file.
-This is a transitional index. The long-term goal is for *muster-board*
-to derive its view directly from the loom/ cards, retiring this file."
+This is a regular file; `muster-board' simply opens it."
   :type 'string
-  :group 'muster-deck)
-
-(defcustom muster-board-current "deck.md"
-  "Current active card to show in the board buffer.
-When non-nil, only this card is shown instead of the top N active items."
-  :type 'string
-  :group 'muster-deck)
-
-(defcustom muster-board-show-progress t
-  "Whether to render each card's `### progress' section in *muster-board*."
-  :type 'boolean
   :group 'muster-deck)
 
 ;;; Core helpers
@@ -89,175 +74,78 @@ When non-nil, only this card is shown instead of the top N active items."
   (expand-file-name muster-root))
 
 (defun muster--log-file ()
-  "Return path to the current channel log file."
-  (expand-file-name (format "%s/log.md" muster-channel) (muster--expand-root)))
+  "Return path to the global log file."
+  (expand-file-name "log.jsonl" (muster--expand-root)))
 
-(defun muster--board-file ()
-  "Return expanded path to the board file."
-  (expand-file-name muster-board-file))
-
-(defun muster--parse-active-items ()
-  "Parse the current task from `muster-board-file'.
-When `muster-board-current' is set, returns only that card's info.
-Otherwise returns all active (🟣) items.
-Returns a list of (TITLE PATH STATUS PROGRESS) tuples."
-  (let ((file (muster--board-file))
-        items in-active)
-    (when (file-readable-p file)
+(defun muster--current-name ()
+  "Return the current muster identity from ~/.config/muster/.me, if any."
+  (let ((me-file (expand-file-name ".me" (muster--expand-root))))
+    (when (file-readable-p me-file)
       (with-temp-buffer
-        (insert-file-contents file)
-        (goto-char (point-min))
-        (while (not (eobp))
-          (let ((line (buffer-substring-no-properties
-                       (line-beginning-position) (line-end-position))))
-            (cond
-             ((string-match-p "^## *active" line)
-              (setq in-active t))
-             ((and in-active (string-match-p "^##" line))
-              (setq in-active nil))
-             ((and in-active (string-match "^ *\\(?:[📬👟⚙✰🕳🌀] \\)?🟣 +\\[\\([^]]+\\)\\](\\([^)]+\\))" line))
-              (let* ((title (match-string 1 line))
-                     (path (match-string 2 line))
-                     (card-info (muster--parse-card-info path)))
-                (push (list title path
-                            (car card-info)
-                            (cadr card-info))
-                      items)))))
-          (forward-line 1))))
-    (let ((result (nreverse items)))
-      (if muster-board-current
-          (seq-filter (lambda (it) (string= (cadr it) muster-board-current)) result)
-        result))))
-
-(defun muster--parse-card-info (path)
-  "Read card PATH and return (STATUS PROGRESS).
-STATUS is the `status' line text.  PROGRESS is a list of non-empty
-lines from the `### progress' section, if present."
-  (let ((file (expand-file-name path (file-name-directory (muster--board-file))))
-        status progress in-progress)
-    (when (file-readable-p file)
-      (with-temp-buffer
-        (insert-file-contents file)
-        (goto-char (point-min))
-        (while (not (eobp))
-          (let ((line (buffer-substring-no-properties
-                       (line-beginning-position) (line-end-position))))
-            (cond
-             ((and (null status) (string-match "^status\\s-+\\(.+\\)" line))
-              (setq status (match-string 1 line)))
-             ((string-match-p "^### *progress" line)
-              (setq in-progress t))
-             ((and in-progress (string-match-p "^#" line))
-              (setq in-progress nil))
-             (in-progress
-              (let ((trimmed (string-trim line)))
-                (unless (string-empty-p trimmed)
-                  (push trimmed progress))))))
-            (forward-line 1))))
-    (list status (nreverse progress))))
+        (insert-file-contents me-file)
+        (string-trim (buffer-string))))))
 
 ;;; Sending
 
 ;;;###autoload
 (defun muster-send (begin end)
-  "Send active region from BEGIN to END to muster.
+  "Send active region from BEGIN to END to muster as `muster-name'.
 If no region is active, send the whole buffer, but only when in
-`muster-compose-mode' to avoid accidentally posting source files."
+`muster-post-mode' to avoid accidentally posting source files.
+The caller's existing identity in ~/.config/muster/.me is saved and
+restored after posting so the deck doesn't drift the global identity."
   (interactive "r")
   (let* ((use-region (use-region-p))
          (begin (if use-region begin (point-min)))
          (end (if use-region end (point-max))))
     (when (= begin end)
       (user-error "Nothing to send"))
-    (unless (or use-region (derived-mode-p 'muster-compose-mode))
-      (user-error "No active region; switch to muster-compose to send a full buffer"))
-    (let ((text (string-trim (buffer-substring-no-properties begin end))))
+    (unless (or use-region (derived-mode-p 'muster-post-mode))
+      (user-error "No active region; switch to muster-post to send a full buffer"))
+    (let ((text (string-trim (buffer-substring-no-properties begin end)))
+          (previous-name (muster--current-name))
+          (coding-system-for-write 'utf-8))
       (when (string-empty-p text)
         (user-error "Nothing to send"))
-      ;; muster resolves the sender from ~/.config/muster/.me. Keep that
-      ;; in sync with `muster-name' so the Emacs config stays authoritative.
-      ;; Force UTF-8 so circuit symbols and marks survive argv handoff.
-      (let ((coding-system-for-write 'utf-8))
-        (call-process "muster" nil nil nil "name" muster-name)
-        (call-process "muster" nil nil nil "post" text)))
-    (when (derived-mode-p 'muster-compose-mode)
+      ;; Post as `muster-name', then restore the previous identity so the
+      ;; deck doesn't hijack the global .me file.
+      (unwind-protect
+          (progn
+            (call-process "muster" nil nil nil "name" muster-name)
+            (call-process "muster" nil nil nil "--channel" muster-channel "post" text))
+        (when (and previous-name (not (string-empty-p previous-name)))
+          (call-process "muster" nil nil nil "name" previous-name))))
+    (when (derived-mode-p 'muster-post-mode)
       (erase-buffer))))
 
-;;; Compose buffer
+;;; Post buffer
 
-(defvar muster-compose-mode-map
+(defvar muster-post-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-<return>") #'muster-send)
     map)
-  "Keymap for `muster-compose-mode'.")
+  "Keymap for `muster-post-mode'.")
 
-(define-derived-mode muster-compose-mode text-mode "Muster-Compose"
+(define-derived-mode muster-post-mode text-mode "Muster-Post"
   "Major mode for composing muster posts."
   (setq-local truncate-lines nil)
   (setq-local word-wrap t))
 
 ;;;###autoload
-(defun muster-compose ()
-  "Open the muster compose buffer."
+(defun muster-post ()
+  "Open the muster post buffer."
   (interactive)
-  (pop-to-buffer muster-compose-buffer-name)
-  (unless (derived-mode-p 'muster-compose-mode)
-    (muster-compose-mode)))
+  (pop-to-buffer muster-post-buffer-name)
+  (unless (derived-mode-p 'muster-post-mode)
+    (muster-post-mode)))
 
-;;; Board buffer
-
-(defvar muster-board-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "g") #'muster-board)
-    map)
-  "Keymap for `muster-board-mode'.")
-
-(define-derived-mode muster-board-mode text-mode "Muster-Board"
-  "Major mode for the board pane."
-  (setq-local truncate-lines t)
-  (setq-local buffer-read-only t))
-
-(defun muster-board--open-card (path)
-  "Open board card PATH in a new frame."
-  (let ((full (expand-file-name path (file-name-directory (muster--board-file)))))
-    (find-file-other-frame full)))
-
-(defun muster-board--render ()
-  "Render the board content into the current buffer."
-  (let ((items (muster--parse-active-items))
-        (inhibit-read-only t))
-    (erase-buffer)
-    (insert "⟴ board\n\n")
-    (if (null items)
-        (insert "  no active items\n")
-      (dolist (item items)
-        (let* ((title (car item))
-               (path (cadr item))
-               (status (nth 2 item))
-               (progress (nth 3 item))
-               (start (point)))
-          (insert (format "  %s" title))
-          (let ((title-end (point)))
-            (when status
-              (insert (format "  — %s" status)))
-            (insert "\n")
-            (make-text-button start title-end
-                              'action (lambda (_btn) (muster-board--open-card path))
-                              'follow-link t
-                              'help-echo (format "Open %s" path)))
-          (when (and muster-board-show-progress progress)
-            (dolist (line progress)
-              (insert (format "    %s\n" line)))))))))
+;;; Board file
 
 ;;;###autoload
 (defun muster-board ()
-  "Open the board buffer with the top active loom cards and progress sections."
+  "Open the board file as a regular file."
   (interactive)
-  (let ((buf (get-buffer-create muster-board-buffer-name)))
-    (with-current-buffer buf
-      (muster-board--render)
-      (muster-board-mode))
-    (pop-to-buffer buf)))
+  (find-file (expand-file-name muster-board-file)))
 
 ;;; Log buffer
 
@@ -279,6 +167,7 @@ If no region is active, send the whole buffer, but only when in
 
 (defvar muster-log-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "t") #'muster-log-toggle-timestamps)
     map)
   "Keymap for `muster-log-mode'.")
 
@@ -294,27 +183,55 @@ If no region is active, send the whole buffer, but only when in
     (decode-coding-region (point-min) (point-max) 'utf-8)
     (buffer-string)))
 
-(defun muster-log--unescape (s)
-  "Turn escaped newlines in muster log frames into real newlines."
-  (replace-regexp-in-string "\\\\n" "\n" s))
+(defun muster-log--format-line (line)
+  "Format a raw log LINE for display.
+Accepts stamped JSONL (`id', `ts', `from', `to', `thread', `body') and the
+legacy bracket format `[ts] sender: body'.  Lines not addressed to the
+current `muster-channel' are ignored.  Unparseable lines are returned as-is."
+  (or (ignore-errors
+        (let* ((obj (json-read-from-string line))
+               (id (cdr (assoc 'id obj)))
+               (ts (cdr (assoc 'ts obj)))
+               (from (cdr (assoc 'from obj)))
+               (to (cdr (assoc 'to obj)))
+               (body (cdr (assoc 'body obj))))
+          (when (and id ts from body
+                     (seq-find (lambda (c) (string= c muster-channel)) to))
+            (if muster-log-show-timestamps
+                (format "[%s@%s] %s: %s" id ts from body)
+              (format "%s: %s" from body)))))
+      (when (string-match "^\[\([^@]+\)@\([^\]]+\)\] +\([^:]+\): +\(.*\)$" line)
+        (let ((id (match-string 1 line))
+              (ts (match-string 2 line))
+              (from (match-string 3 line))
+              (body (match-string 4 line)))
+          (if muster-log-show-timestamps
+              (format "[%s@%s] %s: %s" id ts from body)
+            (format "%s: %s" from body))))
+      (when (string-match "^\[\([^\]]+\)\] +\([^:]+\): +\(.*\)$" line)
+        (let ((ts (match-string 1 line))
+              (sender (match-string 2 line))
+              (body (match-string 3 line)))
+          (if muster-log-show-timestamps
+              (format "[%s] %s: %s" ts sender body)
+            (format "%s: %s" sender body))))
+      line))
 
-(defun muster-log--strip-timestamps (s)
-  "Remove `[YYYY-MM-DDTHH:MM:SS] ' prefixes from log lines."
-  (replace-regexp-in-string "^\\[[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T[0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}\\] " "" s))
-
-(defun muster-log-refresh ()
+(defun muster-log-refresh (&optional force)
   "Refresh the log buffer from the file, preserving scroll position.
-Skip if the file content is unchanged since the last refresh.  Keeps the
-tail in view for any window that was already at the end of the log."
+When FORCE is non-nil, re-render even if the file content appears
+unchanged.  Keeps the tail in view for any window that was already at
+the end of the log."
   (when-let ((buf (get-buffer muster-log-buffer-name)))
     (with-current-buffer buf
       (let* ((inhibit-read-only t)
              (raw (muster-log--read-file))
-             (contents (muster-log--unescape raw))
-             (contents (if muster-log-show-timestamps
-                           contents
-                         (muster-log--strip-timestamps contents))))
-        (unless (string= contents (buffer-string))
+             (contents (mapconcat #'muster-log--format-line
+                                  (split-string raw "
+")
+                                  "
+")))
+        (when (or force (not (string= contents (buffer-string))))
           (let ((window-states
                  (mapcar (lambda (w)
                            (let ((pt (window-point w)))
@@ -336,6 +253,14 @@ Multiple file-notify events in quick succession collapse into one refresh."
     (cancel-timer muster-log--timer))
   (setq muster-log--timer
         (run-with-timer 0.05 nil #'muster-log-refresh)))
+
+(defun muster-log-toggle-timestamps ()
+  "Toggle timestamp display in `*muster-log*' and force a re-render."
+  (interactive)
+  (setq muster-log-show-timestamps (not muster-log-show-timestamps))
+  (message "Muster log timestamps %s"
+           (if muster-log-show-timestamps "on" "off"))
+  (muster-log-refresh t))
 
 (defun muster-log-start-watch ()
   "Start watching the log file.
@@ -380,37 +305,30 @@ Prefer file-notify events; fall back to a polling timer if unavailable."
 
 ;;;###autoload
 (defun muster-deck ()
-  "Open the full deck: board + log side by side, compose across the bottom."
+  "Open the full deck: log on top, post across the bottom."
   (interactive)
   (delete-other-windows)
-  ;; Split into top and bottom first, so bottom spans full width.
+  ;; Split into top (log) and bottom (post), so post spans full width.
   (split-window-below)
   (let* ((top-win (selected-window))
          (bottom-win (next-window))
-         (board-buf (get-buffer-create muster-board-buffer-name))
          (log-buf (get-buffer-create muster-log-buffer-name))
-         (compose-buf (get-buffer-create muster-compose-buffer-name))
-         (top-right (split-window top-win nil 'right)))
-    ;; Top-left: board
-    (set-window-buffer top-win board-buf)
-    (with-current-buffer board-buf
-      (muster-board-mode)
-      (muster-board--render))
-    ;; Top-right: log
-    (set-window-buffer top-right log-buf)
+         (post-buf (get-buffer-create muster-post-buffer-name)))
+    ;; Top: log
+    (set-window-buffer top-win log-buf)
     (with-current-buffer log-buf
       (muster-log-mode)
       (setq buffer-read-only t)
       (muster-log-start-watch)
       (muster-log-refresh)
       (goto-char (point-max)))
-    (set-window-point top-right (with-current-buffer log-buf (point-max)))
-    ;; Bottom: compose
+    (set-window-point top-win (with-current-buffer log-buf (point-max)))
+    ;; Bottom: post
     (select-window bottom-win)
-    (set-window-buffer bottom-win compose-buf)
-    (with-current-buffer compose-buf
-      (unless (derived-mode-p 'muster-compose-mode)
-        (muster-compose-mode)))
+    (set-window-buffer bottom-win post-buf)
+    (with-current-buffer post-buf
+      (unless (derived-mode-p 'muster-post-mode)
+        (muster-post-mode)))
     (select-window top-win)))
 
 ;;;###autoload
@@ -418,9 +336,8 @@ Prefer file-notify events; fall back to a polling timer if unavailable."
   "Close muster deck buffers and stop the log watcher."
   (interactive)
   (muster-log-stop-watch)
-  (dolist (buf (list muster-compose-buffer-name
-                     muster-log-buffer-name
-                     muster-board-buffer-name))
+  (dolist (buf (list muster-post-buffer-name
+                     muster-log-buffer-name))
     (when-let ((b (get-buffer buf)))
       (kill-buffer b))))
 

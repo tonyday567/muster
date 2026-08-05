@@ -16,8 +16,8 @@
 --     by line number — one source (the log), no gap, no duplicates;
 --   * per-client outbound is a bounded 'TBQueue', drop-oldest;
 --   * the commit path is waited: FIFO failures come back as error frames;
---   * newline characters in bodies are escaped in the frame so the log
---     stays one line per post;
+--   * the log stores one JSON Lines message per line; the body is kept
+--     literal and JSON string encoding handles newlines in the standard way;
 --   * the emit port parses once: clients receive structured JSON
 --     (@postJson@) — the deck's regex parser is dead.
 module Muster.Ws
@@ -29,13 +29,20 @@ module Muster.Ws
   )
 where
 
+import Circuit.Agent (Post (..))
+import Circuit.Agent.Framing
+  ( parseLineAt,
+    stampId,
+    stampTs,
+    stamped,
+  )
+import Circuit.Parser.Json (Json (..), encodeJson)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitEither)
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
 import Control.Concurrent.STM
 import Control.Exception (IOException, SomeException, displayException, finally, try)
-import Control.Monad (filterM, forever, void, when)
-import Circuit.Parser.Json (Json (..), encodeJson)
+import Control.Monad (forever, void, when)
 import Cursor qualified as Cur
 import Data.ByteString.Lazy qualified as LBS
 import Data.Map.Strict qualified as Map
@@ -45,6 +52,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Free.Agent.Diagram (meetingSkeleton)
+import Muster.Bus (matchesChannel)
 import Muster.Channel
   ( Channel,
     ChannelConfig (..),
@@ -52,8 +60,9 @@ import Muster.Channel
     channelSend,
     defaultChannelConfig,
   )
+import Muster.Api.Bus qualified as ApiBus
+import Muster.Api.Types (BusRoot (..), unChannel)
 import Muster.Diagram (diagramJson, readMeetingPosts, renderSkeletonSvg)
-import Muster.Framing qualified as Framing
 import Network.HTTP.Types (parseQuery, status200, status400, status404)
 import Network.Wai
   ( Application,
@@ -145,7 +154,7 @@ newChannelEntry root identity chanName = do
           { chChannel = chanName,
             chBusRoot = root
           }
-      logf = root </> chanName </> "log.md"
+      logf = root </> "log.jsonl"
   mch <- timeout attachTimeoutUs (channelAttach cfg)
   ch <- case mch of
     Just c -> pure c
@@ -155,8 +164,6 @@ newChannelEntry root identity chanName = do
   -- the log (rather than via the FIFO) makes the join frame history,
   -- so connected clients do not see a phantom live post shifting
   -- message numbers. This fixes the ghost-join bug.
-  ts <- Framing.formatNow
-  TIO.appendFile logf (Framing.frameMessage ts identity ("joined channel " <> T.pack chanName) <> "\n")
   fan <- newBroadcastTChanIO
   -- Private in-memory cursor, complete lines only, absolute numbers.
   -- The Channel's file cursor (.cursor-deck) is deliberately unused:
@@ -164,9 +171,10 @@ newChannelEntry root identity chanName = do
   cur <- Cur.newMem 0
   Cur.seekEndFile cur logf
   pump <- async $ forever $ do
-    ls <- map (uncurry BusLine) <$> Cur.pollNumberedFile cur logf
+    allLs <- map (uncurry BusLine) <$> Cur.pollNumberedFile cur logf
+    let ls = filter (matchesChannel (T.pack chanName) . blRaw) allLs
     atomically $ mapM_ (writeTChan fan) ls
-    when (null ls) $ threadDelay 50_000
+    when (null allLs) $ threadDelay 50_000
   pure (ChannelEntry ch fan pump)
 
 -- ---------------------------------------------------------------------------
@@ -177,30 +185,39 @@ newChannelEntry root identity chanName = do
 -- view).  Unparseable lines carry null sender/body.
 postJson :: Bool -> BusLine -> Text
 postJson hist (BusLine n raw) =
-  case Framing.parseMessage raw of
-    Just (sender, body) ->
-      T.concat
-        [ "{\"type\":\"post\",\"history\":",
-          if hist then "true" else "false",
-          ",\"n\":",
-          T.pack (show n),
-          ",\"raw\":",
-          jsonStr raw,
-          ",\"sender\":",
-          jsonStr sender,
-          ",\"body\":",
-          jsonStr body,
-          "}"
-        ]
+  case parseLineAt 0 raw of
+    Just stored ->
+      let p = stamped stored
+       in T.concat
+            [ "{\"type\":\"post\",\"history\":",
+              if hist then "true" else "false",
+              ",\"n\":",
+              T.pack (show n),
+              ",\"id\":",
+              T.pack (show (stampId stored)),
+              ",\"ts\":",
+              jsonStr (stampTs stored),
+              ",\"from\":",
+              jsonStr (from p),
+              ",\"to\":",
+              jsonStrArr (to p),
+              ",\"thread\":",
+              jsonNumArr (thread p),
+              ",\"body\":",
+              jsonStr (body p),
+              ",\"raw\":",
+              jsonStr raw,
+              "}"
+            ]
     Nothing ->
       T.concat
         [ "{\"type\":\"post\",\"history\":",
           if hist then "true" else "false",
           ",\"n\":",
           T.pack (show n),
-          ",\"raw\":",
+          ",\"id\":null,\"ts\":null,\"from\":null,\"to\":[],\"thread\":[],\"body\":null,\"raw\":",
           jsonStr raw,
-          ",\"sender\":null,\"body\":null}"
+          "}"
         ]
 
 -- | An error frame: post failures and validation rejections, made
@@ -219,6 +236,12 @@ jsonStr t =
       | c == '\r' = "\\r"
       | c == '\t' = "\\t"
       | otherwise = T.singleton c
+
+jsonStrArr :: [Text] -> Text
+jsonStrArr xs = "[" <> T.intercalate "," (map jsonStr xs) <> "]"
+
+jsonNumArr :: [Natural] -> Text
+jsonNumArr xs = "[" <> T.intercalate "," (map (T.pack . show) xs) <> "]"
 
 -- ---------------------------------------------------------------------------
 -- Application
@@ -247,7 +270,7 @@ clientApp cfg manager pending = do
   conn <- acceptRequest pending
   let chan = extractChannelFromWs pending (wcChannel cfg)
   entry <- getOrCreateChannel (wcBusRoot cfg) (wcName cfg) manager chan
-  let logf = wcBusRoot cfg </> chan </> "log.md"
+  let logf = wcBusRoot cfg </> "log.jsonl"
   clientSession entry (T.pack chan) logf (wcHistory cfg) conn
 
 clientSession :: ChannelEntry -> Text -> FilePath -> Int -> Connection -> IO ()
@@ -256,7 +279,7 @@ clientSession entry chan logf hist conn = do
   -- here on, and the line-number filter below removes the overlap. One
   -- source (the log), no gap, no duplicates.
   myFan <- atomically $ dupTChan (ceFan entry)
-  histLines <- readHistoryNumbered logf hist
+  histLines <- readHistoryNumbered logf chan hist
   let histMax = foldl' (\acc (n, _) -> max acc n) 0 histLines
   outQ <- newTBQueueIO outBound
   inQ <- newTQueueIO
@@ -295,7 +318,8 @@ encodeOut (OutError e) = errorJson e
 encodeOut (OutDiagram chan) = T.concat ["{\"type\":\"diagram\",\"channel\":", jsonStr chan, "}"]
 
 -- | The commit path, validated. Empty bodies are dropped; multi-line
--- content is supported via newline escaping in the frame layer.
+-- content is supported natively because the frame layer stores the body
+-- as a literal JSON string.
 handlePost :: ChannelEntry -> Text -> IO ()
 handlePost entry t
   | T.null body = pure ()
@@ -310,16 +334,16 @@ writeDropOldest q x = do
   when full $ void (tryReadTBQueue q)
   writeTBQueue q x
 
--- | Read the last @n@ complete lines of a log, with absolute 1-based
--- line numbers.
-readHistoryNumbered :: FilePath -> Int -> IO [(Int, Text)]
-readHistoryNumbered path n = do
+-- | Read the last @n@ complete lines of a channel view of the global log,
+-- with absolute 1-based line numbers.
+readHistoryNumbered :: FilePath -> Text -> Int -> IO [(Int, Text)]
+readHistoryNumbered path channel n = do
   ls <- Cur.readLogLinesComplete path
-  let numbered = zip [1 ..] ls
+  let numbered = filter (matchesChannel channel . snd) (zip [1 ..] ls)
   pure $
     if n <= 0
       then []
-      else drop (max 0 (length ls - n)) numbered
+      else drop (max 0 (length numbered - n)) numbered
 
 -- | Extract the channel name from the WebSocket request's query string
 -- (any position, not just first). Returns the default channel if absent.
@@ -351,8 +375,8 @@ staticApp cfg req respond =
           chan = case lookup "channel" qs of
             Just (Just c) -> decodeUtf8 c
             _ -> T.pack (wcChannel cfg)
-          chanLogf = wcBusRoot cfg </> T.unpack chan </> "log.md"
-      body <- buildStateJson (wcBoard cfg) (wcBusRoot cfg </> "agents") chanLogf chan (wcName cfg)
+          logf = wcBusRoot cfg </> "log.jsonl"
+      body <- buildStateJson (wcBoard cfg) (wcBusRoot cfg </> "agents") logf chan (wcName cfg)
       respond $
         responseLBS
           status200
@@ -371,7 +395,7 @@ staticApp cfg req respond =
     -- wiring record aligned over the log, drawn by 'meetingSkeleton'.
     ["api", "diagram"] -> do
       let chan = queryChannel cfg req
-      posts <- readMeetingPosts (wcBusRoot cfg </> T.unpack chan) (wcHistory cfg)
+      posts <- readMeetingPosts (wcBusRoot cfg) chan (wcHistory cfg)
       let body =
             LBS.fromStrict $
               encodeJson $
@@ -390,7 +414,7 @@ staticApp cfg req respond =
     -- The same skeleton rendered to SVG (strings-svg -> chart-svg).
     ["api", "diagram.svg"] -> do
       let chan = queryChannel cfg req
-      posts <- readMeetingPosts (wcBusRoot cfg </> T.unpack chan) (wcHistory cfg)
+      posts <- readMeetingPosts (wcBusRoot cfg) chan (wcHistory cfg)
       respond $
         responseLBS
           status200
@@ -430,20 +454,11 @@ queryChannel cfg req =
     Just (Just c) -> decodeUtf8 c
     _ -> T.pack (wcChannel cfg)
 
--- | List available channel directories under the bus root.
+-- | List channels with traffic in the global log.
 listChannels :: FilePath -> IO [String]
 listChannels root = do
-  exists <- doesDirectoryExist root
-  if not exists
-    then pure []
-    else do
-      ents <- listDirectory root
-      let isChannelDir name = do
-            let full = root </> name
-                tname = T.pack name
-            isDir <- doesDirectoryExist full
-            pure (isDir && name /= "." && name /= ".." && name /= "agents" && not ("_" `T.isPrefixOf` tname) && not ("." `T.isPrefixOf` tname))
-      filterM isChannelDir ents
+  chans <- ApiBus.listChannels (BusRoot root)
+  pure (map T.unpack (unChannel <$> chans))
 
 serveHtml :: WsConfig -> Request -> (Response -> IO a) -> IO a
 serveHtml cfg req respond = do
@@ -489,8 +504,8 @@ buildStateJson :: FilePath -> FilePath -> FilePath -> Text -> Text -> IO Text
 buildStateJson boardPath agentsDir logf channel identity = do
   board <- readFileUtf8 boardPath
   agents <- listAgents agentsDir
-  lastBy <- lastLinesBySender logf 30
-  msession <- readSessionInfo (takeDirectory logf)
+  lastBy <- lastLinesBySender logf channel 30
+  msession <- readSessionInfo (takeDirectory logf) channel
   let hermesRow = agentJson (AgentInfo "hermes" "active" Nothing "") (Map.lookup "hermes" lastBy)
       allAgentRows = hermesRow : [ agentJson a (Map.lookup (agName a) lastBy) | a <- agents, agStatus a /= "down" ]
       projects = projectLines board
@@ -537,9 +552,9 @@ data SessionInfo = SessionInfo
     siLogStart :: Int
   }
 
-readSessionInfo :: FilePath -> IO (Maybe SessionInfo)
-readSessionInfo dir = do
-  let path = dir </> "session.md"
+readSessionInfo :: FilePath -> Text -> IO (Maybe SessionInfo)
+readSessionInfo dir channel = do
+  let path = dir </> "session-" <> T.unpack channel <> ".md"
   exists <- doesFileExist path
   if not exists
     then pure Nothing
@@ -648,18 +663,22 @@ readModel path = do
         (m : _) -> m
         [] -> ""
 
-lastLinesBySender :: FilePath -> Int -> IO (Map.Map Text Text)
-lastLinesBySender path n = do
+lastLinesBySender :: FilePath -> Text -> Int -> IO (Map.Map Text Text)
+lastLinesBySender path channel n = do
   exists <- doesFileExist path
   if not exists
     then pure Map.empty
     else do
       raw <- TIO.readFile path
-      let ls = reverse $ take n $ reverse $ filter (not . T.null) $ T.lines raw
+      let ls =
+            reverse $
+              take n $
+                reverse $
+                  filter (\l -> not (T.null l) && matchesChannel channel l) (T.lines raw)
           step m line =
-            case Framing.parseMessage line of
+            case parseLineAt 0 line of
               Nothing -> m
-              Just (sender, _) -> Map.insert sender line m
+              Just stored -> Map.insert (from (stamped stored)) line m
       pure $ foldl' step Map.empty ls
 
 projectLines :: Text -> [Text]

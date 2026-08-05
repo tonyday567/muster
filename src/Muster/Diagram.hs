@@ -1,17 +1,13 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The live deck diagram (launch L3): read a channel's log + @dag.md@
--- wiring record back as a 'SDiagram' skeleton, serialise it as JSON for
--- @GET \/api\/diagram@, and render it to SVG bytes for
--- @GET \/api\/diagram.svg@.
+-- | The live deck diagram (launch L3): read a channel's stamped log back as
+-- a 'SDiagram' skeleton, serialise it as JSON for @GET \/api\/diagram@, and
+-- render it to SVG bytes for @GET \/api\/diagram.svg@.
 --
--- The log carries only @[ts] sender: body@ — thread ancestry lives in the
--- @dag.md@ sidecar written by 'Muster.Api.Bus.postWithThread'.  Coverage
--- may be partial (plain 'Muster.Api.Bus.post' writes no dag entry), so a
--- log line without a matching dag entry is honestly a root: "no wiring
--- recorded", never an invented merge.  With no @dag.md@ at all, every
--- line is a root.
+-- The log carries JSON Lines of stamped 'Post Text'
+-- (@{"id":..., "ts":..., "from":..., "to":..., "thread":..., "body":...}@).
+-- Thread ancestry is now part of every log line; there is no sidecar.
 module Muster.Diagram
   ( readMeetingPosts,
     diagramJson,
@@ -21,79 +17,24 @@ where
 
 import Chart (encodeChartOptions)
 import Circuit.Agent (Post (..))
-import Circuit.Parser.Json (Json (..), decodeJson)
+import Circuit.Agent.Framing (parseLineAt, stamped)
+import Circuit.Parser.Json (Json (..))
 import Circuit.Poly.StringDiagram (SDiagram (..))
 import Cursor qualified as Cur
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (encodeUtf8)
-import Data.Text.IO qualified as TIO
-import Data.Vector qualified as V
-import Muster.Framing qualified as Framing
 import Strings.Svg.Render (renderSDiagram)
-import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import Prelude
 
--- | One @dag.md@ line: the wiring record of a single post.
-data DagEntry = DagEntry
-  { deFrom :: Text,
-    deThread :: [Text],
-    deBody :: Text
-  }
-
--- | Parse one @dag.md@ JSON line. Anything malformed is dropped — a
--- half-written or corrupted line must not kill the whole diagram.
-parseDagEntry :: Text -> Maybe DagEntry
-parseDagEntry line = case decodeJson (encodeUtf8 line) of
-  Right (JObject o) -> do
-    JString f <- lookup "from" o
-    JString b <- lookup "body" o
-    ts <- case lookup "thread" o of
-      Just (JArray a) -> traverse (\case JString t -> Just t; _ -> Nothing) (V.toList a)
-      _ -> Nothing
-    pure (DagEntry f ts b)
-  _ -> Nothing
-
--- | Read every parseable @dag.md@ entry, in file order. Missing file is
--- not an error: it means "no wiring recorded".
-readDag :: FilePath -> IO [DagEntry]
-readDag path = do
-  exists <- doesFileExist path
-  if not exists
-    then pure []
-    else do
-      raw <- TIO.readFile path
-      pure [e | l <- T.lines raw, Just e <- [parseDagEntry l]]
-
--- | Align dag entries to parsed log lines greedily, in order: the first
--- dag entry whose from+body matches the line is consumed and supplies the
--- thread ancestry; a line without a matching entry gets @thread=[]@.
-alignPosts :: [DagEntry] -> [(Text, Text)] -> [Post Text]
-alignPosts dags = go dags
-  where
-    go _ [] = []
-    go ds ((sender, body) : rest) = case ds of
-      (d : ds')
-        | deFrom d == sender && deBody d == body ->
-            Post sender [] (deThread d) body : go ds' rest
-      _ -> Post sender [] [] body : go ds rest
-
--- | Reconstruct the meeting from a channel directory: parse the log into
--- @(sender, body)@ pairs, align the @dag.md@ wiring record over the full
--- log (alignment is positional, so the tail alone would mismatch), then
--- keep the last @n@ posts — the same tail the ws history sends.
-readMeetingPosts :: FilePath -> Int -> IO [Post Text]
-readMeetingPosts chanDir histN = do
-  ls <- Cur.readLogLinesComplete (chanDir </> "log.md")
-  dags <- readDag (chanDir </> "dag.md")
-  let parsed =
-        [ (sender, body)
-          | l <- ls,
-            Just (sender, body) <- [Framing.parseMessage l]
-        ]
-      posts = alignPosts dags parsed
+-- | Reconstruct the meeting for a channel from the global log: parse the
+-- stamped log into 'Post Text' values, keep only posts addressed to the
+-- channel, and keep the last @n@ posts — the same tail the ws history sends.
+readMeetingPosts :: FilePath -> Text -> Int -> IO [Post Text]
+readMeetingPosts root channel histN = do
+  ls <- Cur.readLogLinesComplete (root </> "log.jsonl")
+  let posts = [stamped s | l <- ls, Just s <- [parseLineAt 0 l], channel `elem` to (stamped s)]
   pure (takeLast histN posts)
   where
     takeLast m xs

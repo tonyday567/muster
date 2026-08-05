@@ -7,8 +7,17 @@
 --
 -- Behaviour-preserving port of @~/mg/logs/board/mailbox.sh@: FIFO + append-only
 -- log, cursor-based read, and pidfile-guarded watch.  The bus daemon opens the
--- FIFO read-write so it never sees EOF between messages (the @cat \<>fifo@
+-- FIFO read-write so it never sees EOF between messages (the @cat \<\>fifo@
 -- trick, without shelling out to @cat@).
+--
+-- The canonical storage format is one stamped 'Post Text' per line
+-- (@log.jsonl@).  The daemon is the single writer: clients submit a bare
+-- 'Post Text' JSONL line on the FIFO and the daemon assigns the absolute id
+-- (current line count) and timestamp before appending.
+--
+-- Phase 5: one global log under the bus root.  Channels are no longer
+-- directories; the channel name lives in the @to@ field of each post.
+-- Readers filter the global log by channel; cursors are root-level files.
 module Muster.Bus
   ( BusPaths (..),
     pathsFor,
@@ -24,9 +33,23 @@ module Muster.Bus
     wait,
     dumpLog,
     countLogLines,
+    stampLine,
+    matchesChannel,
   )
 where
 
+import Circuit.Agent (Post (..), PostId)
+import Circuit.Agent.Framing
+  ( Stamped (..),
+    formatNow,
+    framePost,
+    frameStored,
+    parseLine,
+    parseLineAt,
+    parsePost,
+    renderStored,
+    stamped,
+  )
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, catch, finally, try)
 import Control.Monad (forever, unless, void, when)
@@ -37,7 +60,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Muster.Cursor qualified as Cur
-import Muster.Framing (formatNow, frameMessage)
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
@@ -79,9 +101,9 @@ import Prelude
 -- Paths
 -- ---------------------------------------------------------------------------
 
--- | Standard files inside a channel directory.
+-- | Standard files inside the bus root.
 data BusPaths = BusPaths
-  { busDir :: FilePath,
+  { busRoot :: FilePath,
     busFifo :: FilePath,
     busLog :: FilePath,
     busErr :: FilePath,
@@ -89,25 +111,25 @@ data BusPaths = BusPaths
   }
   deriving (Show, Eq)
 
--- | Compute standard paths from a channel directory.
+-- | Compute standard paths from a bus root.
 pathsFor :: FilePath -> BusPaths
-pathsFor dir =
+pathsFor root =
   BusPaths
-    { busDir = dir,
-      busFifo = dir </> "bus.fifo",
-      busLog = dir </> "log.md",
-      busErr = dir </> "err.md",
-      busPid = dir </> "bus.pid"
+    { busRoot = root,
+      busFifo = root </> "bus.fifo",
+      busLog = root </> "log.jsonl",
+      busErr = root </> "err.md",
+      busPid = root </> "bus.pid"
     }
 
 watchPidFile :: FilePath -> FilePath -> FilePath
-watchPidFile dir cursorfile =
+watchPidFile root cursorfile =
   -- Use takeFileName (not takeBaseName): cursors are ".watch-NAME" / ".cursor-NAME"
   -- and takeBaseName would strip ".NAME" as a fake extension, collapsing every
   -- watcher onto one pidfile (".watch.pid-.watch") — multi-watcher death.
   let base = takeFileName cursorfile
       watchname = fromMaybe base (stripPrefix' ".cursor-" base)
-   in dir </> ".watch.pid-" <> watchname
+   in root </> ".watch.pid-" <> watchname
   where
     stripPrefix' p s
       | p `isPrefixOf` s = Just (drop (length p) s)
@@ -120,10 +142,10 @@ pidToInt (CPid x) = fromIntegral x
 -- Log metrics
 -- ---------------------------------------------------------------------------
 
--- | Count newline bytes in a log (match @wc -l@).
+-- | Count newline bytes in the global log (match @wc -l@).
 countLogLines :: FilePath -> IO Int
-countLogLines dir = do
-  let p = pathsFor dir
+countLogLines root = do
+  let p = pathsFor root
   exists <- doesFileExist (busLog p)
   if not exists
     then pure 0
@@ -192,12 +214,12 @@ signalKill pid = void $ do
 -- Daemon
 -- ---------------------------------------------------------------------------
 
--- | Long-running bus: open FIFO RDWR (never EOF between writers) and append
--- each line to the log.
+-- | Long-running bus: open FIFO RDWR (never EOF between writers), stamp each
+-- incoming bare 'Post Text' line, and append it to the global log.
 busDaemon :: FilePath -> IO ()
-busDaemon dir = do
-  let p = pathsFor dir
-  createDirectoryIfMissing True dir
+busDaemon root = do
+  let p = pathsFor root
+  createDirectoryIfMissing True root
   self <- getProcessID
   writeFile (busPid p) (show (pidToInt self) <> "\n")
   -- Block on reads.  When every external writer closes, 'hGetLine'
@@ -217,15 +239,52 @@ busDaemon dir = do
       relay :: Handle -> Handle -> IO ()
       relay h logH = forever do
         line <- TIO.hGetLine h
-        TIO.hPutStrLn logH line
+        stampedLine <- stampLine (busLog p) line
+        TIO.hPutStrLn logH stampedLine
         hFlush logH
   forever relayOnce
 
+-- | Assign an absolute id and timestamp to a FIFO line.
+--
+-- If the line is already a stamped 'StoredPost', it is appended unchanged.
+-- Otherwise it is parsed as a bare 'Post Text', assigned the current line
+-- count as its id, and stamped.
+stampLine :: FilePath -> Text -> IO Text
+stampLine logPath line =
+  case parseLine line of
+    Just stored -> pure (frameStored stored)
+    Nothing -> do
+      case parsePost line of
+        Just p -> do
+          nextId <- countLogLinesFromPath logPath
+          ts <- formatNow
+          pure (frameStored (Stamped (fromIntegral nextId) ts p))
+        Nothing -> do
+          -- Unparseable payload: append it as a stamped root post from the
+          -- bus itself so the line is never silently lost.
+          nextId <- countLogLinesFromPath logPath
+          ts <- formatNow
+          pure
+            ( frameStored
+                ( Stamped
+                    (fromIntegral nextId)
+                    ts
+                    (Post "bus" [] [] ("unparseable: " <> line))
+                )
+            )
+
+countLogLinesFromPath :: FilePath -> IO Int
+countLogLinesFromPath logPath = do
+  exists <- doesFileExist logPath
+  if not exists
+    then pure 0
+    else T.count "\n" <$> TIO.readFile logPath
+
 -- | Start the bus daemon by re-execing the current binary as @bus daemon@.
-busStart :: FilePath -> String -> FilePath -> IO ()
-busStart dir channel busRoot = do
-  let p = pathsFor dir
-  createDirectoryIfMissing True dir
+busStart :: FilePath -> IO ()
+busStart root = do
+  let p = pathsFor root
+  createDirectoryIfMissing True root
   running <- busRunning p
   case running of
     Just pid -> putStrLn $ "bus already running (pid " <> show (pidToInt pid) <> ")"
@@ -244,18 +303,14 @@ busStart dir channel busRoot = do
       let cp =
             ( proc
                 exe
-                [ "-c",
-                  channel,
-                  "--bus-root",
-                  busRoot,
-                  "bus",
+                [ "bus",
                   "daemon"
                 ]
             )
               { std_in = NoStream,
                 std_out = NoStream,
                 std_err = UseHandle errH,
-                cwd = Just dir,
+                cwd = Just root,
                 close_fds = True
               }
       (_, _, _, _ph) <- createProcess cp
@@ -270,8 +325,8 @@ busStart dir channel busRoot = do
           exitWith (ExitFailure 1)
 
 busStop :: FilePath -> IO ()
-busStop dir = do
-  let p = pathsFor dir
+busStop root = do
+  let p = pathsFor root
   mpid <- readPidFile (busPid p)
   case mpid of
     Nothing -> putStrLn "bus not running"
@@ -281,10 +336,10 @@ busStop dir = do
       putStrLn "bus stopped"
 
 busStatus :: FilePath -> IO ()
-busStatus dir = do
-  let p = pathsFor dir
+busStatus root = do
+  let p = pathsFor root
   running <- busRunning p
-  nLines <- countLogLines dir
+  nLines <- countLogLines root
   case running of
     Just pid ->
       putStrLn $
@@ -306,40 +361,49 @@ busStatus dir = do
 
 -- | Compact liveness for channel listings.
 busLiveness :: FilePath -> IO String
-busLiveness dir = do
-  running <- busRunning (pathsFor dir)
+busLiveness root = do
+  running <- busRunning (pathsFor root)
   pure $ case running of
     Just pid -> "alive (pid " <> show (pidToInt pid) <> ")"
     Nothing -> "down"
 
 -- ---------------------------------------------------------------------------
+-- Channel filtering helper
+-- ---------------------------------------------------------------------------
+
+-- | True when the channel name appears in the @to@ field of a stamped log line.
+matchesChannel :: Text -> Text -> Bool
+matchesChannel channel line =
+  case parseLineAt 0 line of
+    Just stored -> channel `elem` to (stamped stored)
+    Nothing -> False
+
+-- ---------------------------------------------------------------------------
 -- Post / read / wait / log
 -- ---------------------------------------------------------------------------
 
--- | Post a framed message to the channel. Fails (as an 'IOException') if
+-- | Post a framed message to the global FIFO. Fails (as an 'IOException') if
 -- the bus is down or the log does not grow — callers may catch; the CLI
 -- dies with the same message and exit 1 as before.
-post :: FilePath -> String -> Text -> IO ()
-post dir sender body = do
-  let p = pathsFor dir
+post :: FilePath -> Text -> [Text] -> [PostId] -> Text -> IO ()
+post root from to thread body = do
+  let p = pathsFor root
   running <- busRunning p
   case running of
     Nothing -> do
       hPutStrLn stderr "post FAILED: bus is down (run: muster bus start)"
       ioError (userError "post FAILED: bus is down")
     Just _ -> do
-      before <- countLogLines dir
-      ts <- formatNow
-      let sender' = T.pack sender
-          framed = frameMessage ts sender' body <> "\n"
+      before <- countLogLines root
+      let payload = framePost (Post from to thread body) <> "\n"
       bracket (openFile (busFifo p) WriteMode) hClose \h -> do
         hSetEncoding h utf8
         hSetBuffering h NoBuffering
-        TIO.hPutStr h framed
+        TIO.hPutStr h payload
         hFlush h
       ok <- checkGrew (busLog p) before 20
       unless ok do
-        after <- countLogLines dir
+        after <- countLogLines root
         let msg =
               "post WARNING: log did not grow ("
                 <> show before
@@ -359,31 +423,36 @@ checkGrew logPath before n = do
         then pure False
         else threadDelay 50000 >> checkGrew logPath before (n - 1)
 
--- | Read new lines since the cursor file and print them.
-readNew :: FilePath -> FilePath -> IO ()
-readNew dir cursorfile = do
-  let p = pathsFor dir
-  createDirectoryIfMissing True dir
+-- | Read new lines since the cursor file and print them, restricted to the
+-- given channel.
+readNew :: FilePath -> FilePath -> Text -> IO ()
+readNew root cursorfile channel = do
+  let p = pathsFor root
+  createDirectoryIfMissing True root
   c <- Cur.newFile cursorfile
   ls <- Cur.pollFile c (busLog p)
-  mapM_ TIO.putStrLn ls
+  mapM_ TIO.putStrLn (filter (matchesChannel channel) (map renderStoredLine ls))
 
--- | Read the last @n@ lines of the log, advancing the cursor to the end.
---
--- This is the default behaviour for @muster read@: it gives a newcomer (or a
--- long-polling session) a bounded window instead of dumping the entire backlog.
-readTail :: FilePath -> FilePath -> Int -> IO ()
-readTail dir cursorfile n = do
-  let p = pathsFor dir
+-- | Read the last @n@ lines of the channel's view of the global log,
+-- advancing the cursor to the end.
+readTail :: FilePath -> FilePath -> Int -> Text -> IO ()
+readTail root cursorfile n channel = do
+  let p = pathsFor root
       logPath = busLog p
-  createDirectoryIfMissing True dir
+  createDirectoryIfMissing True root
   c <- Cur.newFile cursorfile
   ls <-
     doesFileExist logPath >>= \case
       False -> pure []
       True -> T.lines <$> TIO.readFile logPath
   Cur.seekEnd c ls
-  mapM_ TIO.putStrLn (takeLast n ls)
+  mapM_ TIO.putStrLn (takeLast n (map renderStoredLine (filter (matchesChannel channel) ls)))
+
+renderStoredLine :: Text -> Text
+renderStoredLine line =
+  case parseLineAt 0 line of
+    Just stored -> renderStored stored
+    Nothing -> line
 
 -- | Last @n@ elements of a list.
 takeLast :: Int -> [a] -> [a]
@@ -393,9 +462,10 @@ takeLast n xs
 
 -- | Block until a message matching the filter appears.
 --
--- The filter predicate receives each raw log line. Return 'True' to wake
--- and print; 'False' to skip (the line is not printed and the wait
--- continues). Pass @const True@ to wake on any message.
+-- The filter predicate receives each raw global log line. Return 'True' to
+-- wake and print; 'False' to skip (the line is not printed and the wait
+-- continues). Callers that care about a single channel should compose
+-- 'matchesChannel' into the predicate.
 --
 -- When messages arrive but none pass the filter (e.g. self-posts), the
 -- elapsed counter is reset to zero — the bus IS alive and delivering,
@@ -406,9 +476,9 @@ wait ::
   Int ->
   (Text -> Bool) ->
   IO ExitCode
-wait dir cursorfile timeoutSec keep = do
-  let p = pathsFor dir
-      wpid = watchPidFile dir cursorfile
+wait root cursorfile timeoutSec keep = do
+  let p = pathsFor root
+      wpid = watchPidFile root cursorfile
   existing <- readPidFile wpid
   case existing of
     Just epid -> do
@@ -453,9 +523,11 @@ wait dir cursorfile timeoutSec keep = do
               threadDelay 1000000
               go c p (elapsed + 1)
 
--- | Dump the full channel log to stdout.
-dumpLog :: FilePath -> IO ()
-dumpLog dir = do
-  let p = pathsFor dir
+-- | Dump the channel's view of the global log to stdout.
+dumpLog :: FilePath -> Text -> IO ()
+dumpLog root channel = do
+  let p = pathsFor root
   exists <- doesFileExist (busLog p)
-  when exists $ TIO.readFile (busLog p) >>= TIO.putStr
+  when exists $ do
+    raw <- TIO.readFile (busLog p)
+    mapM_ (TIO.putStrLn . renderStoredLine) (filter (matchesChannel channel) (T.lines raw))

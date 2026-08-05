@@ -5,11 +5,9 @@
 
 -- | Central bus daemon for the rebuilt muster API.
 --
--- One daemon owns every channel under a 'BusRoot'. It multiplexes channels on
--- demand: new channel directories are picked up by a scan loop and each gets a
--- lightweight relay thread running 'Muster.Bus.busDaemon'. Per-channel FIFOs,
--- logs and cursors live in the channel directory exactly as before; only the
--- ownership model changes from one daemon per channel to one daemon for all.
+-- Phase 5: one daemon owns one global FIFO and one global append-only log
+-- under the 'BusRoot'.  Channel identity is carried in the @to@ field of each
+-- post; readers filter the global log by channel.  Cursors are root-level files.
 module Muster.Api.Bus
   ( -- * Central daemon
     BusHandle,
@@ -22,7 +20,6 @@ module Muster.Api.Bus
 
     -- * Paths and channel discovery
     busRootPath,
-    channelPath,
     cursorPath,
     listChannels,
     isReservedChannel,
@@ -43,33 +40,27 @@ module Muster.Api.Bus
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (Async, async, cancel, pollSTM)
-import Control.Concurrent.STM (atomically)
-import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.Async (Async, async, cancel)
 import Control.Exception (IOException, SomeException, bracket, catch, finally, try)
-import Control.Monad (forever, forM, unless, void, when)
-import Circuit.Parser.Json (Json (..), encodeJson)
-import Data.ByteString qualified as BS
+import Control.Monad (forever, unless, void, when)
 import Data.Char (isSpace)
-import Data.Map.Strict (Map)
-import Data.Maybe (catMaybes)
-import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.IO qualified as TIO
 import Data.Text.Encoding (encodeUtf8)
+import Data.Text.IO qualified as TIO
 import Data.Time.Clock (getCurrentTime)
-import Data.Vector qualified as V
+import Circuit.Agent (Post (..), PostId)
+import Circuit.Agent.Framing (Stamped (..), parseLineAt)
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
 import Muster.Bus qualified as Bus
+import Muster.Bus (matchesChannel)
 import Muster.Cursor qualified as Cur
 import System.Directory
   ( createDirectoryIfMissing,
-    doesDirectoryExist,
     doesFileExist,
-    listDirectory,
     removePathForcibly,
   )
 import System.Environment (getExecutablePath)
@@ -118,19 +109,14 @@ data BusHandle = BusHandle BusRoot (Async ())
 busRootPath :: BusRoot -> FilePath
 busRootPath = unBusRoot
 
--- | Filesystem path of a channel directory.
+-- | Filesystem path of a participant's join cursor inside the bus root.
 --
--- >>> channelPath (BusRoot "/tmp/muster") (Channel "bus")
--- "/tmp/muster/bus"
-channelPath :: BusRoot -> Channel -> FilePath
-channelPath root (Channel c) = busRootPath root </> T.unpack c
-
--- | Filesystem path of a participant's join cursor inside a channel.
+-- Phase 5: cursors are root-level.
 --
 -- >>> cursorPath (BusRoot "/tmp/muster") (Channel "bus") (Nick "kimi")
--- "/tmp/muster/bus/.cursor-kimi"
+-- "/tmp/muster/.cursor-kimi"
 cursorPath :: BusRoot -> Channel -> Nick -> FilePath
-cursorPath root chan (Nick n) = channelPath root chan </> ".cursor-" <> T.unpack n
+cursorPath root _chan (Nick n) = busRootPath root </> ".cursor-" <> T.unpack n
 
 -- | Channels reserved for muster internals. These are never treated as bus
 -- channels by the central daemon.
@@ -146,30 +132,31 @@ reservedChannels = Set.fromList ["agents", "sessions"]
 isReservedChannel :: Channel -> Bool
 isReservedChannel = (`Set.member` reservedChannels)
 
--- | List channel directories under a bus root, excluding reserved names.
+-- | List channels that have traffic in the global log, excluding reserved
+-- names.
+--
+-- Phase 5: channels are views into the global log, not directories.  This
+-- reads the global log and collects channel names from the @to@ field.
 --
 -- >>> let root = BusRoot "/tmp/muster-doctest-list"
--- >>> createDirectoryIfMissing True (busRootPath root </> "bus")
+-- >>> createDirectoryIfMissing True (busRootPath root)
 -- >>> listChannels root
--- [Channel {unChannel = "bus"}]
+-- []
 listChannels :: BusRoot -> IO [Channel]
 listChannels root = do
-  let dir = busRootPath root
-  exists <- doesDirectoryExist dir
+  let logPath = Bus.busLog (Bus.pathsFor (busRootPath root))
+  exists <- doesFileExist logPath
   if not exists
     then pure []
     else do
-      entries <- listDirectory dir
-      chans <-
-        forM entries $ \e -> do
-          let name = T.pack e
-              c = Channel name
-          isDir <- doesDirectoryExist (dir </> e)
-          pure
-            $ if isDir && not (isReservedChannel c) && not ("_" `T.isPrefixOf` name) && not ("." `T.isPrefixOf` name)
-              then Just c
-              else Nothing
-      pure $ Set.toAscList $ Set.fromList $ catMaybes chans
+      ls <- T.lines <$> TIO.readFile logPath
+      pure
+        $ Set.toAscList
+        $ Set.filter (not . isReservedChannel)
+        $ Set.fromList
+        $ map Channel $ concat [to p | l <- ls, Just p <- [parseStored l]]
+  where
+    parseStored l = stamped <$> parseLineAt 0 l
 
 -- | Create a bus root directory if it does not exist.
 ensureBusRoot :: BusRoot -> IO ()
@@ -281,12 +268,14 @@ statusCentral root = do
   running <- isRunning root
   putStrLn $ if running then "bus running" else "bus down"
 
--- | Create a channel directory and FIFO if they do not already exist.
+-- | Ensure the bus root, global FIFO, and global log files exist.
+--
+-- Phase 5: this is channel-agnostic.  Returns the bus root path.
 ensureChannel :: BusRoot -> Channel -> IO FilePath
-ensureChannel root chan = do
-  let dir = channelPath root chan
-      p = Bus.pathsFor dir
-  createDirectoryIfMissing True dir
+ensureChannel root _chan = do
+  let rootPath = busRootPath root
+      p = Bus.pathsFor rootPath
+  createDirectoryIfMissing True rootPath
   fifoExists <- doesFileExist (Bus.busFifo p)
   unless fifoExists $
     void $
@@ -298,7 +287,7 @@ ensureChannel root chan = do
   -- concurrent GHC 'openFile' calls can collide on the RTS lock table.
   touchFile (Bus.busLog p)
   touchFile (Bus.busErr p)
-  pure dir
+  pure rootPath
   where
     touchFile path =
       void $
@@ -308,42 +297,39 @@ ensureChannel root chan = do
           (const (pure ()))
           `catch` \(_ :: IOException) -> pure ()
 
--- | Wait up to two seconds for a channel relay to come alive.
---
--- This smooths the race between creating a channel and the central daemon's
--- scan loop picking it up.
+-- | Wait up to two seconds for the global daemon to come alive.
 waitForChannel :: BusRoot -> Channel -> IO Bool
-waitForChannel root chan = go (20 :: Int)
+waitForChannel root _chan = go (20 :: Int)
   where
     go 0 = pure False
     go n = do
-      dir <- ensureChannel root chan
-      alive <- Bus.busRunning (Bus.pathsFor dir)
+      _ <- ensureChannel root (Channel "bus")
+      alive <- Bus.busRunning (Bus.pathsFor (busRootPath root))
       case alive of
         Just _ -> pure True
         Nothing -> threadDelay 100000 >> go (n - 1)
 
--- | Relay a single channel. Exceptions are caught so one channel cannot crash
--- the central daemon; the scan loop will restart it on the next pass.
-channelRelay :: BusRoot -> Channel -> IO ()
-channelRelay root chan = do
+-- | Global relay: read the single root FIFO and append stamped lines to the
+-- single root log.  Exceptions are caught so a transient FIFO issue does not
+-- crash the daemon; the loop reopens everything and continues.
+globalRelay :: BusRoot -> IO ()
+globalRelay root = do
   self <- getProcessID
-  _dir <- ensureChannel root chan
-  writeFile (Bus.busPid p) (show (pidToInt self) <> "\n")
   -- Log appends go through a raw POSIX fd, held open for the relay's life.
   -- GHC 'openFile' takes an advisory lock (exclusive for AppendMode) in the
   -- RTS lock table: in-process readers (post's growth check, the ws pump)
   -- then intermittently collide with a per-line open, and the collision
   -- used to cost the consumed FIFO line.  A raw fd takes no GHC lock at
   -- all, so readers never see us and no line is lost.  The exception log
-  -- gets the same treatment: the debug err stream is also opened once as a
-  -- raw fd so exception logging cannot itself deadlock on the GHC lock
-  -- table under back-to-back posts.
+  -- gets the same treatment.
+  _ <- ensureChannel root (Channel "bus")
+  writeFile (Bus.busPid p) (show (pidToInt self) <> "\n")
   bracket openLog closeFd $ \logFd ->
     bracket openErr closeFd $ \errFd ->
       forever (relayOnce logFd errFd)
   where
-    p = Bus.pathsFor (channelPath root chan)
+    rootPath = busRootPath root
+    p = Bus.pathsFor rootPath
     openLog =
       openFd
         (Bus.busLog p)
@@ -357,7 +343,6 @@ channelRelay root chan = do
     relayOnce logFd errFd =
       bracket (openFifo p) hClose (\h -> forever (TIO.hGetLine h >>= appendLine logFd))
         `catch` \(e :: IOException) -> dbg errFd e
-    dbg :: Fd -> IOException -> IO ()
     dbg errFd e = do
       ts <- take 19 . show <$> getCurrentTime
       let tag = if isEOFError e then "eof-reopen" else "relay-exception"
@@ -368,7 +353,9 @@ channelRelay root chan = do
       hSetEncoding h utf8
       hSetBuffering h LineBuffering
       pure h
-    appendLine logFd line = fdWriteAll logFd (encodeUtf8 (line <> "\n"))
+    appendLine logFd line = do
+      stampedLine <- Bus.stampLine (Bus.busLog p) line
+      fdWriteAll logFd (encodeUtf8 (stampedLine <> "\n"))
     fdWriteAll :: Fd -> BS.ByteString -> IO ()
     fdWriteAll fd bs
       | BS.null bs = pure ()
@@ -376,55 +363,21 @@ channelRelay root chan = do
           n <- fdWrite fd bs
           fdWriteAll fd (BS.drop (fromIntegral n) bs)
 
--- | One scan pass: make sure every existing channel has a live relay thread,
--- and drop relays for channels that have disappeared.
-scanChannels :: BusRoot -> TVar (Map Channel (Async ())) -> IO ()
-scanChannels root active = do
-  chans <- listChannels root
-  let wanted = Set.fromList chans
-  -- Start or keep relays for wanted channels.
-  mapM_
-    ( \chan -> do
-        need <- atomically $ do
-          m <- readTVar active
-          case Map.lookup chan m of
-            Nothing -> pure True
-            Just a -> do
-              mp <- pollSTM a
-              pure $ case mp of
-                Nothing -> False
-                Just _ -> True
-        when need $ do
-          a <- async (channelRelay root chan)
-          atomically $ modifyTVar' active (Map.insert chan a)
-    )
-    chans
-  -- Cancel relays for removed channels.
-  gone <-
-    atomically $ do
-      m <- readTVar active
-      let (keep, remove) = Map.partitionWithKey (\k _ -> k `Set.member` wanted) m
-      writeTVar active keep
-      pure remove
-  mapM_ cancel gone
-
 -- | Run the central bus daemon forever.
 --
 -- This is the entry point for the background daemon process. It owns the bus
--- root, writes its pid to @muster.pid@, and keeps relay threads alive for every
--- channel under the root.
+-- root, writes its pid to @muster.pid@, and runs the single global relay.
 centralDaemon :: BusRoot -> IO ()
 centralDaemon root = do
   ensureBusRoot root
   writeRootPid root
-  active <- newTVarIO Map.empty
-  let cleanup = atomically (readTVar active) >>= mapM_ cancel
-  (forever $ scanChannels root active >> threadDelay 1_000_000) `finally` cleanup
+  let cleanup = pure ()
+  (globalRelay root) `finally` cleanup
 
 -- | Run the central daemon in-process for the duration of an action.
 --
--- This is convenient for tests and local scripts. The daemon and all of its
--- channel relays are cancelled when the action finishes.
+-- This is convenient for tests and local scripts. The daemon and its global
+-- relay are cancelled when the action finishes.
 withBus :: BusRoot -> (BusHandle -> IO a) -> IO a
 withBus root action = do
   ensureBusRoot root
@@ -436,65 +389,36 @@ post :: BusRoot -> Channel -> Nick -> Text -> IO ()
 post root chan nick body = do
   ok <- waitForChannel root chan
   unless ok $ fail $ "muster: bus not running for channel " <> T.unpack (unChannel chan)
-  let dir = channelPath root chan
-  Bus.post dir (T.unpack (unNick nick)) body
+  let rootPath = busRootPath root
+  Bus.post rootPath (unNick nick) [unChannel chan] [] body
 
--- | Like 'post' (same waited commit, same failure behaviour), but records
--- the thread ancestry in a @dag.md@ sidecar: after the log grows, one JSON
--- line @{"from":sender,"thread":[names],"body":body}@ is appended to
--- @\<chanDir\>/dag.md@.
---
--- The bus log itself carries only @[ts] sender: body@ — ancestry is lost
--- there, so @dag.md@ is the honest wiring record.  Plain 'post' stays
--- untouched: dag coverage may be partial, and readers must treat a missing
--- entry as "no wiring recorded", never as an invented merge.
---
--- The append goes through a raw POSIX fd opened in append mode for the
--- call (O_APPEND), never GHC 'openFile' AppendMode — the RTS lock table
--- collision that cost lines in the relay applies here too.
---
--- dag.md is written /after/ the log commit, so for a single orchestrated
--- writer its lines are order-aligned with log.md.  Concurrent dag writers
--- can misalign (two posts interleave log-vs-dag appends); the stage-L4
--- runner owns that discipline.
-postWithThread :: BusRoot -> Channel -> Nick -> [Text] -> Text -> IO ()
+-- | Like 'post' but also records thread ancestry in the stamped log line.
+postWithThread :: BusRoot -> Channel -> Nick -> [PostId] -> Text -> IO ()
 postWithThread root chan nick thread body = do
-  post root chan nick body
-  let entry =
-        JObject
-          [ ("from", JString (unNick nick)),
-            ("thread", JArray (V.fromList (map JString thread))),
-            ("body", JString body)
-          ]
-      line = encodeJson entry <> "\n"
-  bracket openDag closeFd (writeAll line)
-  where
-    openDag =
-      openFd
-        (channelPath root chan </> "dag.md")
-        WriteOnly
-        defaultFileFlags {append = True, creat = Just stdFileMode}
-    writeAll bs fd
-      | BS.null bs = pure ()
-      | otherwise = do
-          n <- fdWrite fd bs
-          writeAll (BS.drop (fromIntegral n) bs) fd
+  ok <- waitForChannel root chan
+  unless ok $ fail $ "muster: bus not running for channel " <> T.unpack (unChannel chan)
+  let rootPath = busRootPath root
+  Bus.post rootPath (unNick nick) [unChannel chan] thread body
 
--- | Read all unread lines for a participant on a channel, advancing the cursor.
+-- | Read all unread raw log lines for a participant on a channel, advancing
+-- the cursor.  Callers that want human display should render with
+-- 'Circuit.Agent.Framing.renderStored'.
 readNext :: BusRoot -> Channel -> Nick -> IO [Text]
 readNext root chan nick = do
-  let dir = channelPath root chan
+  let rootPath = busRootPath root
       cursor = cursorPath root chan nick
-      logPath = Bus.busLog (Bus.pathsFor dir)
+      logPath = Bus.busLog (Bus.pathsFor rootPath)
   c <- Cur.newFile cursor
-  Cur.pollFile c logPath
+  ls <- Cur.pollFile c logPath
+  pure (filter (matchesChannel (unChannel chan)) ls)
 
--- | Read the last @n@ lines of a channel log, advancing the cursor to the end.
+-- | Read the last @n@ raw log lines of a channel, advancing the cursor to the
+-- end of the global log.
 readTail :: BusRoot -> Channel -> Nick -> Int -> IO [Text]
 readTail root chan nick n = do
-  let dir = channelPath root chan
+  let rootPath = busRootPath root
       cursor = cursorPath root chan nick
-      logPath = Bus.busLog (Bus.pathsFor dir)
+      logPath = Bus.busLog (Bus.pathsFor rootPath)
   exists <- doesFileExist logPath
   ls <-
     if exists
@@ -502,7 +426,7 @@ readTail root chan nick n = do
       else pure []
   c <- Cur.newFile cursor
   Cur.seekEnd c ls
-  pure (takeLast n ls)
+  pure (takeLast n (filter (matchesChannel (unChannel chan)) ls))
   where
     takeLast m xs
       | m <= 0 = []

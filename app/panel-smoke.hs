@@ -24,7 +24,7 @@ import Muster.Agent
   )
 import Muster.Api.Bus (ensureChannel, post, readTail, withBus)
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
-import Muster.Framing (parseMessage)
+import Circuit.Agent.Framing (parseMessage)
 import System.Directory (removePathForcibly)
 import System.Exit (exitFailure)
 import Prelude
@@ -101,9 +101,9 @@ main = do
     sOuts <- runShard synthSeat finalRoundPosts
 
     assert "synth emits one synthesis" $ length sOuts == 1
-    assert "synthesis ancestry cites every panelist" $
+    assert "synthesis has no thread edges (generic shard has no stamped ids)" $
       case sOuts of
-        [o] -> thread o == ["agent-1", "agent-2", "agent-3"]
+        [o] -> thread o == []
         _ -> False
 
     -- Post synthesis to the bus.

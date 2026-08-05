@@ -22,7 +22,7 @@ import Muster.Agent
   )
 import Muster.Api.Bus (ensureChannel, post, readNext, withBus)
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..), unBusRoot, unChannel)
-import Muster.Framing (parseMessage)
+import Circuit.Agent.Framing (parseMessage)
 import System.Directory (removePathForcibly)
 import System.Exit (exitFailure)
 
@@ -60,16 +60,16 @@ main = do
     assert "sessionPrompt joins bodies" $
       sessionPrompt [p1, p2] == "hi\nthere"
     assert "replyPosts addresses last author and preserves wire" $
-      case replyPosts "echo" [p1] "ack" of
+      case replyPosts "echo" [p1] [] "ack" of
         [o] ->
           from o == "echo"
             && to o == ["human"]
             && body o == "ack"
         _ -> False
     assert "replyPosts quiet on empty reply" $
-      null (replyPosts "echo" [p1] "  ")
+      null (replyPosts "echo" [p1] [] "  ")
     assert "replyPosts quiet on empty session" $
-      null (replyPosts "echo" [] "x")
+      null (replyPosts "echo" [] [] "x")
 
   putStrLn "echo Shard IO [Post] [Post]"
   do

@@ -70,7 +70,6 @@ library
         Muster.Cli.Opts
         Muster.Config
         Muster.Cursor
-        Muster.Framing
         Muster.Agent
         Muster.Agent.Seat
         Muster.Connector
@@ -165,6 +164,7 @@ executable muster-seat-verify
 
     build-depends:
         base,
+        circuits-agent,
         directory,
         muster,
         text
@@ -235,6 +235,7 @@ executable muster-bus-composition-smoke
 
     build-depends:
         base,
+        circuits-agent,
         directory,
         muster,
         text
@@ -251,6 +252,7 @@ executable muster-panel-smoke
 
     build-depends:
         base,
+        circuits-agent,
         directory,
         muster,
         text

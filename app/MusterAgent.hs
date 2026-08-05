@@ -79,7 +79,7 @@ import Muster.Channel
   )
 import Muster.Connector (ConnectorConfig (..), defaultConnectorConfig, runConnector)
 import Options.Applicative
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getHomeDirectory)
 import System.Environment (getEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
@@ -217,29 +217,33 @@ agentDir cfg = do
   root <- busRoot cfg
   pure (root </> "agents" </> maName cfg)
 
-agentCursorPattern :: String -> String
-agentCursorPattern name = ".cursor-" <> name
-
--- | Discover every channel under the bus root where this agent has a cursor.
+-- | Discover every channel this agent has joined.
+--
+-- Phase 5: cursors are root-level, so channel membership is recorded in
+-- @.channels-<name>@ under the bus root.
 discoveredChannels :: MusterAgentConfig -> IO [String]
 discoveredChannels cfg = do
   root <- busRoot cfg
-  exists <- doesDirectoryExist root
+  let path = root </> ".channels-" <> maName cfg
+  exists <- doesFileExist path
   if not exists
     then pure []
     else do
-      entries <- listDirectory root
-      sort . concat <$> mapM (channelFor root) entries
-  where
-    channelFor :: FilePath -> FilePath -> IO [String]
-    channelFor root entry = do
-      let dir = root </> entry
-      isDir <- doesDirectoryExist dir
-      if not isDir
-        then pure []
-        else do
-          cursorExists <- doesFileExist (dir </> agentCursorPattern (maName cfg))
-          pure [entry | cursorExists]
+      raw <- TIO.readFile path
+      pure $ sort $ filter (not . null) $ map T.unpack $ T.lines raw
+
+-- | Record that this agent has joined a channel.
+recordChannel :: MusterAgentConfig -> String -> IO ()
+recordChannel cfg channel = do
+  root <- busRoot cfg
+  let path = root </> ".channels-" <> maName cfg
+  exists <- doesFileExist path
+  old <-
+    if exists
+      then map T.unpack . T.lines <$> TIO.readFile path
+      else pure []
+  unless (channel `elem` old) $
+    TIO.appendFile path (T.pack channel <> "\n")
 
 toChannelConfig :: MusterAgentConfig -> String -> ChannelConfig
 toChannelConfig cfg channel =
@@ -520,6 +524,7 @@ runMusterJoin diag cfg channel = do
   diag $ "  joining #" <> channel
   void $ try @SomeException $ runMuster cfg ["name", maName cfg]
   void $ try @SomeException $ runMuster cfg ["join", channel]
+  recordChannel cfg channel
 
 runMusterLeave :: (String -> IO ()) -> MusterAgentConfig -> String -> IO ()
 runMusterLeave diag cfg _channel = do

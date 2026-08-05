@@ -219,8 +219,7 @@ startAgent root nick = do
         else do
           let chan = Channel (unNick nick)
           _ <- Bus.ensureChannel root chan
-          let channelDir = Bus.channelPath root chan
-          total <- BusEngine.countLogLines channelDir
+          total <- BusEngine.countLogLines (Bus.busRootPath root)
           writeFile (Bus.cursorPath root chan nick) (show total <> "\n")
           cfg <- readAgentConfig root nick
           er <- try @SomeException $ do
@@ -294,8 +293,7 @@ renameAgent root old new
           void $ try @IOException $ removePathForcibly (Bus.cursorPath root (Channel (unNick old)) old)
           let newChan = Channel (unNick new)
           _ <- Bus.ensureChannel root newChan
-          let newChannelDir = Bus.channelPath root newChan
-          total <- BusEngine.countLogLines newChannelDir
+          total <- BusEngine.countLogLines (Bus.busRootPath root)
           writeFile (Bus.cursorPath root newChan new) (show total <> "\n")
           pure (Right ())
 

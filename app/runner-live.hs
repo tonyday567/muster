@@ -195,8 +195,8 @@ agentCfg opts name =
 
 joinChannel :: BusRoot -> Channel -> Nick -> IO ()
 joinChannel root c nick = do
-  dir <- ensureChannel root c
-  n <- BusEngine.countLogLines dir
+  _ <- ensureChannel root c
+  n <- BusEngine.countLogLines (busRootPath root)
   writeFile (Bus.cursorPath root c nick) (show n <> "\n")
 
 waitForBus :: BusRoot -> Int -> IO Bool

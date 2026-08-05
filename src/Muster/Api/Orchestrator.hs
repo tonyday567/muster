@@ -117,15 +117,15 @@ watchLoop root mName loop = run $ do
     Part.currentChannel root >>= \case
       Nothing -> fail "join a channel first (muster join <channel>)"
       Just c -> pure c
-  let dir = Bus.channelPath root chan
-      watchCursor = Bus.channelPath root chan </> ".watch-" <> T.unpack (unNick name)
+  let watchCursor = Bus.busRootPath root </> ".watch-" <> T.unpack (unNick name)
       addressed line =
-        ("@" <> unNick name) `T.isInfixOf` line
-          || (unNick name <> ":") `T.isInfixOf` line
+        BusEngine.matchesChannel (unChannel chan) line
+          && (("@" <> unNick name) `T.isInfixOf` line
+                || (unNick name <> ":") `T.isInfixOf` line)
   -- Initialise watch cursor from the join cursor if possible, else tail.
   initWatchCursor root chan name watchCursor
   let once = do
-        exit <- BusEngine.wait dir watchCursor 86400 addressed
+        exit <- BusEngine.wait (Bus.busRootPath root) watchCursor 86400 addressed
         case exit of
           ExitSuccess -> pure ()
           ExitFailure 2 -> pure ()
@@ -143,7 +143,5 @@ initWatchCursor root chan name watchCursor = do
         pure $ case reads raw of
           [(i, _)] -> i
           _ -> 0
-      else do
-        let dir = Bus.channelPath root chan
-        BusEngine.countLogLines dir
+      else BusEngine.countLogLines (Bus.busRootPath root)
   writeFile watchCursor (show n <> "\n")

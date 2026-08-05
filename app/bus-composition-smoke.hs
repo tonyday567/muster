@@ -23,7 +23,7 @@ import Muster.Agent
   )
 import Muster.Api.Bus (ensureChannel, post, readTail, withBus)
 import Muster.Api.Types (BusRoot (..), Channel (..), Nick (..))
-import Muster.Framing (parseMessage)
+import Circuit.Agent.Framing (parseMessage)
 import System.Directory (removePathForcibly)
 import System.Exit (exitFailure)
 import Prelude
